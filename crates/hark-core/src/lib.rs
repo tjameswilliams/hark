@@ -1,7 +1,10 @@
 pub mod db;
+pub mod ffi;
 pub mod models;
 
 pub use db::Db;
+
+uniffi::setup_scaffolding!();
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

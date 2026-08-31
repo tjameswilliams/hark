@@ -1,0 +1,10 @@
+# SwiftPM build output (the root .gitignore already covers .build/ too).
+.build/
+.swiftpm/
+
+# UniFFI-generated sources — emitted by scripts/build-app.sh, never edited.
+Sources/Hark/Generated/
+Sources/hark_coreFFI/
+
+# Assembled app bundle output (scripts/build-app.sh writes <repo>/build/).
+/build/

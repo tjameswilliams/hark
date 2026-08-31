@@ -11,6 +11,9 @@ xcuserdata/
 # macOS
 .DS_Store
 
+# Assembled app bundle (scripts/build-app.sh)
+/build/
+
 # Local artifacts
 *.wav
 *.sqlite
