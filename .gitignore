@@ -1,0 +1,19 @@
+# Rust
+target/
+
+# Swift
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# Local artifacts
+*.wav
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env

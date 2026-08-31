@@ -1,0 +1,21 @@
+[package]
+name = "hark-engine-spike"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: the repo root workspace excludes spikes/.
+[workspace]
+
+[lib]
+name = "hark_engine_spike"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }
+
+[profile.release]
+debug = false

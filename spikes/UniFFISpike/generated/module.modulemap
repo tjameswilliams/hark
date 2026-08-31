@@ -1,0 +1,7 @@
+module hark_engine_spikeFFI {
+    header "hark_engine_spikeFFI.h"
+    export *
+    use "Darwin"
+    use "_Builtin_stdbool"
+    use "_Builtin_stdint"
+}

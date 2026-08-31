@@ -1,0 +1,10 @@
+[package]
+name = "hark-mcp"
+description = "Hark stdio MCP server: query meetings and projects from AI tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hark-core = { path = "../hark-core" }
