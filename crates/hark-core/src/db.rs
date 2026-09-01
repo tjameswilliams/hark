@@ -126,6 +126,7 @@ const MIGRATIONS: &[&str] = &[
 
 pub struct Db {
     conn: Connection,
+    read_only: bool,
 }
 
 impl Db {
@@ -140,11 +141,50 @@ impl Db {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// Opens an existing Hark database strictly read-only (used by hark-mcp,
+    /// which may run concurrently with the app). No migrations run — instead
+    /// the schema version is verified, so a too-old database errors clearly.
+    ///
+    /// The WAL journal mode is a property of the database file itself, so a
+    /// read-only reader participates in WAL snapshots automatically; combined
+    /// with `busy_timeout` this is safe alongside the app's writer connection.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        register_sqlite_vec();
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        // Belt and braces: even an accidental write statement fails fast.
+        conn.pragma_update(None, "query_only", "ON")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if (version as usize) < MIGRATIONS.len() {
+            return Err(crate::Error::SchemaOutOfDate {
+                found: version,
+                required: MIGRATIONS.len(),
+            });
+        }
+        Ok(Db {
+            conn,
+            read_only: true,
+        })
+    }
+
+    /// True when this handle was opened via `open_read_only`.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
-        let db = Db { conn };
+        let db = Db {
+            conn,
+            read_only: false,
+        };
         db.migrate()?;
         Ok(db)
     }

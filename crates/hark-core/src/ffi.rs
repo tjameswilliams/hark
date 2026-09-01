@@ -115,6 +115,34 @@ pub struct HarkStore {
     embedder: Embedder,
 }
 
+/// Rust-only surface (not exported over UniFFI): the read-only store used by
+/// hark-mcp, which runs concurrently with the app against the same WAL file.
+impl HarkStore {
+    /// Opens an existing database strictly read-only — no migrations, no
+    /// writes possible. All read APIs (search, list_*, transcripts, counts)
+    /// work; write APIs return a clear error instead.
+    pub fn open_read_only(path: &str) -> Result<Arc<Self>, HarkError> {
+        let db = Db::open_read_only(std::path::Path::new(path))?;
+        Ok(Arc::new(Self {
+            db: Mutex::new(db),
+            embedder: Embedder::new(),
+        }))
+    }
+}
+
+/// Guard for write paths: read-only stores refuse cleanly rather than
+/// surfacing a raw SQLITE_READONLY error (or worse, a panic).
+fn check_writable(db: &Db) -> Result<(), HarkError> {
+    if db.is_read_only() {
+        return Err(HarkError::Failure(
+            "this Hark database handle is read-only (opened by hark-mcp); \
+             writes happen only in the Hark app"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[uniffi::export]
 impl HarkStore {
     /// Opens (creating and migrating as needed) the database at `path`.
@@ -139,6 +167,7 @@ impl HarkStore {
         duration_ms: i64,
     ) -> Result<i64, HarkError> {
         let db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
         let conn = db.conn();
         // Title: first line of the best text, truncated on a char boundary.
         let best = cleaned_text.as_deref().unwrap_or(&raw_text);
@@ -214,6 +243,7 @@ impl HarkStore {
         segments: Vec<MeetingSegmentInput>,
     ) -> Result<i64, HarkError> {
         let mut db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
         let tx = db.conn_mut().transaction()?;
 
         tx.execute(
@@ -312,6 +342,7 @@ impl HarkStore {
     /// Permanently deletes one dictation (cascades to segments/notes).
     pub fn delete_dictation(&self, id: i64) -> Result<(), HarkError> {
         let db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
         db.conn().execute(
             "DELETE FROM sessions WHERE id = ?1 AND kind = 'dictation'",
             [id],
@@ -336,6 +367,7 @@ impl HarkStore {
         // Also purge embeddings orphaned by session deletes.
         {
             let mut db = self.db.lock().expect("hark db lock poisoned");
+            check_writable(&db)?;
             let tx = db.conn_mut().transaction()?;
             let pending: Vec<i64> = {
                 let mut stmt = tx.prepare(
@@ -613,6 +645,7 @@ impl HarkStore {
         description: Option<String>,
     ) -> Result<i64, HarkError> {
         let db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
         db.conn().execute(
             "INSERT INTO projects (name, description) VALUES (?1, ?2)",
             rusqlite::params![name, description],
@@ -644,6 +677,7 @@ impl HarkStore {
     /// ON DELETE SET NULL); embedding metadata is synced to unassigned (0).
     pub fn delete_project(&self, id: i64) -> Result<(), HarkError> {
         let mut db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
         let tx = db.conn_mut().transaction()?;
         let chunk_ids: Vec<i64> = {
             let mut stmt = tx.prepare(
@@ -674,6 +708,7 @@ impl HarkStore {
         project_id: Option<i64>,
     ) -> Result<(), HarkError> {
         let mut db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
         let tx = db.conn_mut().transaction()?;
         tx.execute(
             "UPDATE sessions SET project_id = ?1 WHERE id = ?2",
@@ -877,5 +912,98 @@ mod tests {
         assert!(transcript.starts_with("[00:00] SPEAKER_00: Let's talk"));
         assert!(transcript.contains("[00:04] SPEAKER_01: Agreed"));
         assert!(transcript.contains("[01:07] SPEAKER_00: Done then."));
+    }
+
+    /// Two connections on one WAL file: the app's writer store and hark-mcp's
+    /// read-only store, held open simultaneously. The reader must see rows the
+    /// writer commits (each fresh read statement takes a new WAL snapshot),
+    /// and every write path on the reader must fail cleanly.
+    #[test]
+    fn read_only_store_sees_concurrent_writes_and_refuses_writes() {
+        let dir = std::env::temp_dir().join(format!("hark-ffi-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(dir.join("test.sqlite-wal"));
+        let _ = std::fs::remove_file(dir.join("test.sqlite-shm"));
+        let path_str = path.to_string_lossy().into_owned();
+
+        let writer = HarkStore::open(path_str.clone()).unwrap();
+        writer
+            .record_dictation(
+                "first note".into(),
+                None,
+                None,
+                "2026-09-01T08:00:00Z".into(),
+                "2026-09-01T08:00:02Z".into(),
+                2000,
+            )
+            .unwrap();
+
+        // Open read-only while the writer connection is still open.
+        let reader = HarkStore::open_read_only(&path_str).unwrap();
+        assert_eq!(reader.dictation_count().unwrap(), 1);
+
+        // A commit made *after* the reader opened must be visible too.
+        writer
+            .record_dictation(
+                "second note".into(),
+                None,
+                None,
+                "2026-09-01T08:01:00Z".into(),
+                "2026-09-01T08:01:02Z".into(),
+                2000,
+            )
+            .unwrap();
+        assert_eq!(reader.dictation_count().unwrap(), 2);
+        let recent = reader.recent_dictations(10).unwrap();
+        assert_eq!(recent[0].raw_text, "second note");
+
+        // Read APIs work; write APIs refuse with a clear error, no panic.
+        assert!(reader.list_projects().unwrap().is_empty());
+        let err = reader
+            .record_dictation(
+                "nope".into(),
+                None,
+                None,
+                "2026-09-01T08:02:00Z".into(),
+                "2026-09-01T08:02:01Z".into(),
+                1000,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "got: {err}");
+        assert!(reader
+            .index_pending("/tmp/unused".into())
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+        assert!(reader.delete_dictation(1).unwrap_err().to_string().contains("read-only"));
+        assert!(reader
+            .create_project("p".into(), None)
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+    }
+
+    /// A database from an older app build (fewer migrations applied) must be
+    /// rejected with the "open the Hark app once" message, not half-work.
+    #[test]
+    fn read_only_rejects_out_of_date_schema() {
+        let dir = std::env::temp_dir().join(format!("hark-ffi-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.sqlite");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let err = match HarkStore::open_read_only(&path.to_string_lossy()) {
+            Err(e) => e,
+            Ok(_) => panic!("out-of-date schema must be rejected"),
+        };
+        assert!(
+            err.to_string().contains("open the Hark app once"),
+            "got: {err}"
+        );
     }
 }

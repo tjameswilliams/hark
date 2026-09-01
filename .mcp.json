@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hark": {
+      "command": "/Users/timwilliams/www/projects/lightning-open-whispr/target/release/hark-mcp",
+      "args": []
+    }
+  }
+}

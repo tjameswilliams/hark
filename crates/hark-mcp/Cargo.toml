@@ -8,3 +8,11 @@ repository.workspace = true
 
 [dependencies]
 hark-core = { path = "../hark-core" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+toml_edit = { workspace = true }
