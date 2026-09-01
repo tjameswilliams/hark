@@ -10,6 +10,7 @@ import Foundation
 @MainActor
 final class StatusItemController: NSObject, NSMenuDelegate {
     private let pipeline: DictationPipeline
+    private let meeting: MeetingController
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
 
@@ -19,11 +20,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let cleanupLine = NSMenuItem(title: "Cleanup: off", action: nil, keyEquivalent: "")
     private let inputSubmenu = NSMenu(title: "Input Device")
 
+    private let meetingStatusLine = NSMenuItem(title: "Recording meeting…", action: nil, keyEquivalent: "")
+    private let meetingToggleItem = NSMenuItem(title: "Start Meeting Recording", action: nil, keyEquivalent: "")
+    private let meetingsSubmenu = NSMenu(title: "Recent Meetings")
+    /// 1 s tick that refreshes the elapsed-time line; runs only while a
+    /// meeting recording is in progress.
+    private var meetingTimer: Timer?
+
     private let relativeFormatter = RelativeDateTimeFormatter()
     private let isoParser = ISO8601DateFormatter()
 
-    init(pipeline: DictationPipeline) {
+    init(pipeline: DictationPipeline, meeting: MeetingController) {
         self.pipeline = pipeline
+        self.meeting = meeting
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
@@ -59,6 +68,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         inputItem.submenu = inputSubmenu
         menu.addItem(inputItem)
 
+        // Meeting recording group.
+        menu.addItem(.separator())
+        meetingStatusLine.isEnabled = false
+        meetingStatusLine.isHidden = true
+        menu.addItem(meetingStatusLine)
+        meetingToggleItem.action = #selector(toggleMeetingRecording(_:))
+        meetingToggleItem.target = self
+        menu.addItem(meetingToggleItem)
+        let meetingsItem = NSMenuItem(title: "Recent Meetings", action: nil, keyEquivalent: "")
+        meetingsSubmenu.autoenablesItems = false
+        meetingsItem.submenu = meetingsSubmenu
+        menu.addItem(meetingsItem)
+        menu.addItem(.separator())
+
         let permissionsItem = NSMenuItem(
             title: "Permissions…", action: #selector(showPermissions), keyEquivalent: "")
         permissionsItem.target = self
@@ -74,7 +97,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         pipeline.onStateChange = { [weak self] state in
             self?.statusLine.title = state.label
         }
+        meeting.onStateChange = { [weak self] state in
+            self?.meetingStateChanged(state)
+        }
         rebuildRecentSubmenu()
+        rebuildMeetingsSubmenu()
+        refreshMeetingItems()
     }
 
     // MARK: - NSMenuDelegate
@@ -89,6 +117,84 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         enableItem.state = pipeline.dictationEnabled ? .on : .off
         rebuildRecentSubmenu()
         rebuildInputSubmenu()
+        rebuildMeetingsSubmenu()
+        refreshMeetingItems()
+    }
+
+    // MARK: - Meeting recording
+
+    private func meetingStateChanged(_ state: MeetingState) {
+        switch state {
+        case .recording:
+            // .common mode so the tick fires while the menu is open
+            // (menu tracking runs the runloop in a non-default mode).
+            // Target/selector, not the block API — the @Sendable block would
+            // need to capture this non-Sendable MainActor object.
+            if meetingTimer == nil {
+                let timer = Timer(
+                    timeInterval: 1, target: self, selector: #selector(meetingTimerTick),
+                    userInfo: nil, repeats: true)
+                RunLoop.main.add(timer, forMode: .common)
+                meetingTimer = timer
+            }
+        case .idle:
+            meetingTimer?.invalidate()
+            meetingTimer = nil
+        }
+        refreshMeetingItems()
+    }
+
+    @objc private func meetingTimerTick() {
+        refreshMeetingItems()
+    }
+
+    /// Mirrors the meeting state into the toggle title and the (hidden while
+    /// idle) elapsed-time status line.
+    private func refreshMeetingItems() {
+        switch meeting.state {
+        case .recording(let startedAt):
+            let elapsed = max(0, Int(Date().timeIntervalSince(startedAt)))
+            meetingStatusLine.title = String(
+                format: "Recording meeting — %02d:%02d", elapsed / 60, elapsed % 60)
+            meetingStatusLine.isHidden = false
+            meetingToggleItem.title = "Stop Meeting Recording"
+        case .idle:
+            if meeting.isProcessing {
+                meetingStatusLine.title = "Processing meeting… (appears in Recent Meetings when done)"
+                meetingStatusLine.isHidden = false
+            } else {
+                meetingStatusLine.isHidden = true
+            }
+            meetingToggleItem.title = "Start Meeting Recording"
+        }
+    }
+
+    private func rebuildMeetingsSubmenu() {
+        meetingsSubmenu.removeAllItems()
+        let records = meeting.recentMeetings(limit: 10)
+        guard !records.isEmpty else {
+            let none = NSMenuItem(title: "(none yet)", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            meetingsSubmenu.addItem(none)
+            return
+        }
+        for record in records {
+            let title = record.title ?? "Meeting #\(record.id)"
+            let when: String
+            if let date = isoParser.date(from: record.startedAt) {
+                when = relativeFormatter.localizedString(for: date, relativeTo: Date())
+            } else {
+                when = record.startedAt
+            }
+            let speakers = "\(record.speakerCount) speaker\(record.speakerCount == 1 ? "" : "s")"
+            let item = NSMenuItem(
+                title: "\(title) — \(when) — \(speakers)",
+                action: #selector(copyMeetingTranscript(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = record.id
+            item.toolTip = "Click to copy the transcript"
+            meetingsSubmenu.addItem(item)
+        }
     }
 
     private func rebuildInputSubmenu() {
@@ -158,6 +264,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func toggleDictation(_ sender: NSMenuItem) {
         pipeline.setDictationEnabled(!pipeline.dictationEnabled)
         sender.state = pipeline.dictationEnabled ? .on : .off
+    }
+
+    @objc private func toggleMeetingRecording(_ sender: NSMenuItem) {
+        if meeting.isRecording {
+            meeting.stopRecording()
+        } else {
+            meeting.startRecording()
+        }
+        refreshMeetingItems()
+    }
+
+    @objc private func copyMeetingTranscript(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? Int64,
+              let transcript = meeting.transcript(id: id)
+        else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(transcript, forType: .string)
+        harkLog("copied the transcript of meeting #\(id) to the clipboard.")
     }
 
     @objc private func copyRecent(_ sender: NSMenuItem) {

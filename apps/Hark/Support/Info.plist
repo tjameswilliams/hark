@@ -22,6 +22,8 @@
 	<string>15.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Hark records meeting audio (system sound + microphone) to transcribe it on-device.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Hark converts your speech to text on-device.</string>
 	<key>NSPrincipalClass</key>

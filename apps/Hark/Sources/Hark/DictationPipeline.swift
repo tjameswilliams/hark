@@ -69,6 +69,9 @@ final class DictationPipeline: NSObject {
 
     private let mic = MicCapture()
     private let pasteEngine = PasteEngine()
+    /// Floating HUD capsule (waveform while listening, shimmer while
+    /// transcribing/cleaning). Non-activating: never steals focus.
+    private let indicator = IndicatorController()
     /// ISO8601DateFormatter defaults to UTC with a Z suffix.
     private let isoFormatter = ISO8601DateFormatter()
 
@@ -335,6 +338,7 @@ final class DictationPipeline: NSObject {
             pressedAppContext = nil
             capturing = false
             _ = mic.endCapture()
+            indicator.hide()
         }
         harkLog("dictation \(enabled ? "enabled" : "disabled").")
         refreshState()
@@ -401,6 +405,7 @@ final class DictationPipeline: NSObject {
         pressedAppContext = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         capturing = true
         mic.beginCapture()
+        indicator.show(.listening) { [mic] in mic.currentLevel() }
         harkLog("listening… (release right ⌘ to transcribe & paste)")
         refreshState()
     }
@@ -423,6 +428,7 @@ final class DictationPipeline: NSObject {
             harkLog(String(
                 format: "tap ignored (%.0f ms < %d ms threshold) — audio discarded.",
                 held.millisecondsValue, 300))
+            indicator.hide()
             refreshState()
             return
         }
@@ -447,6 +453,7 @@ final class DictationPipeline: NSObject {
                 usual culprit: System Settings > Privacy & Security >
                 Microphone -> enable Hark.
                 """)
+            indicator.hide()
             refreshState()
             return
         }
@@ -477,12 +484,17 @@ final class DictationPipeline: NSObject {
                     right input device is selected.
                     """)
             }
+            indicator.hide()
             refreshState()
             return
         }
 
-        guard let transcriber else { return }
+        guard let transcriber else {
+            indicator.hide()
+            return
+        }
         busy = true
+        indicator.transition(to: .transcribing)
         refreshState()
         dictationTask = Task {
             do {
@@ -499,6 +511,7 @@ final class DictationPipeline: NSObject {
                     var text = rawText
                     var cleanedForStore: String?
                     if let cleaner {
+                        indicator.transition(to: .cleaning)
                         let outcome = await cleaner.clean(rawText)
                         if outcome.cleaned {
                             harkLog(String(
@@ -527,6 +540,9 @@ final class DictationPipeline: NSObject {
             } catch {
                 harkLog("transcription failed: \(error)")
             }
+            // One hide for every task outcome: paste done, empty transcript,
+            // or transcription error.
+            indicator.hide()
             busy = false
             refreshState()
         }
@@ -567,6 +583,7 @@ final class DictationPipeline: NSObject {
     // MARK: - Teardown
 
     func teardown() {
+        indicator.hide()
         dictationTask?.cancel()
         axRetryTimer?.invalidate()
         axRetryTimer = nil

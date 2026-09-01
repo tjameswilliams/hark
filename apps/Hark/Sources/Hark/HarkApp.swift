@@ -6,17 +6,23 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pipeline: DictationPipeline?
+    private var meetingController: MeetingController?
     private var statusController: StatusItemController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         harkLog("Hark 0.1.0 starting.")
         let pipeline = DictationPipeline()
         self.pipeline = pipeline
-        self.statusController = StatusItemController(pipeline: pipeline)
+        // The store opens inside pipeline.start(); the provider closure keeps
+        // construction order irrelevant.
+        let meeting = MeetingController(storeProvider: { pipeline.store })
+        self.meetingController = meeting
+        self.statusController = StatusItemController(pipeline: pipeline, meeting: meeting)
         pipeline.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        meetingController?.teardown()
         pipeline?.teardown()
     }
 

@@ -69,6 +69,23 @@ final class CaptureState: @unchecked Sendable {
     }
 }
 
+/// Latest peak amplitude of the downmixed capture chunk, written by the HAL
+/// IOProc on the IO queue and polled by the indicator HUD on the main actor.
+/// Same lock discipline as CaptureState; the critical sections are one store
+/// and one load.
+final class LevelMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Float = 0
+
+    func update(_ newValue: Float) {
+        lock.withLock { value = newValue }
+    }
+
+    func read() -> Float {
+        lock.withLock { value }
+    }
+}
+
 /// The converter (and the pending-buffer handoff slot) are only ever touched
 /// from the IOProc block (which the HAL invokes on our serial IO queue), so
 /// boxing them as @unchecked Sendable is safe in practice.
@@ -104,6 +121,7 @@ final class ConverterBox: @unchecked Sendable {
 @MainActor
 final class MicCapture {
     private let state = CaptureState()
+    private let meter = LevelMeter()
     private(set) var isWarm = false
 
     /// UID of the input device Hark is pinned to; nil follows the system
@@ -188,7 +206,7 @@ final class MicCapture {
         // AVAudioEngine tap: EXC_BREAKPOINT in dispatch_assert_queue).
         var newProcID: AudioDeviceIOProcID?
         let createStatus = AudioDeviceCreateIOProcIDWithBlock(
-            &newProcID, device.id, ioQueue, Self.makeIOBlock(state: state, box: box))
+            &newProcID, device.id, ioQueue, Self.makeIOBlock(state: state, box: box, meter: meter))
         guard createStatus == noErr, let created = newProcID else {
             throw MicCaptureError.coreAudio("AudioDeviceCreateIOProcIDWithBlock", createStatus)
         }
@@ -210,7 +228,7 @@ final class MicCapture {
     /// Runs on the IO queue — deliberately built outside any actor context so
     /// no isolation is inferred.
     private nonisolated static func makeIOBlock(
-        state: CaptureState, box: ConverterBox
+        state: CaptureState, box: ConverterBox, meter: LevelMeter
     ) -> AudioDeviceIOBlock {
         { _, inInputData, _, _, _ in
             // Cheap early-out while idle: no conversion work between dictations.
@@ -251,6 +269,13 @@ final class MicCapture {
             }
             mono.frameLength = AVAudioFrameCount(frames)
 
+            // Level meter for the indicator HUD: peak of this downmixed chunk.
+            // Only computed while capturing (the isCapturing early-out above),
+            // so idle cost stays zero.
+            var chunkPeak: Float = 0
+            for i in 0..<frames { chunkPeak = max(chunkPeak, abs(dst[i])) }
+            meter.update(chunkPeak)
+
             // Streaming conversion: feed exactly this buffer, then report
             // .noDataNow so the converter keeps its resampler state alive for
             // the next IO callback.
@@ -284,11 +309,19 @@ final class MicCapture {
     }
 
     func beginCapture() {
+        meter.update(0)
         state.begin()
     }
 
     func endCapture() -> (samples: [Float], firstBufferAt: ContinuousClock.Instant?) {
-        state.end()
+        meter.update(0)
+        return state.end()
+    }
+
+    /// Latest capture-chunk peak amplitude (0…1-ish raw peak; the indicator
+    /// view normalizes). Zero while idle.
+    func currentLevel() -> Float {
+        meter.read()
     }
 
     func teardown() {

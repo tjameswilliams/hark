@@ -130,6 +130,10 @@ impl Db {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
 }
 
 #[cfg(test)]
