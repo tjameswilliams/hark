@@ -2,14 +2,15 @@ import AppKit
 
 /// Application delegate: wires the pipeline to the status item and owns the
 /// app lifecycle. Hark is a menu-bar app (activation policy .accessory,
-/// LSUIElement in Info.plist) — no dock icon; the management window promotes
-/// it to .regular only while open.
+/// LSUIElement in Info.plist) — never a Dock icon: the management and
+/// settings windows open with the app still in .accessory.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pipeline: DictationPipeline?
     private var meetingController: MeetingController?
     private var statusController: StatusItemController?
     private var mainWindowController: MainWindowController?
+    private var settingsWindowController: SettingsWindowController?
     private var knowledge: RealKnowledgeService?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -24,8 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.knowledge = knowledge
         let mainWindow = MainWindowController(knowledge: knowledge)
         self.mainWindowController = mainWindow
+        let settingsWindow = SettingsWindowController(pipeline: pipeline)
+        self.settingsWindowController = settingsWindow
         self.statusController = StatusItemController(
-            pipeline: pipeline, meeting: meeting, mainWindow: mainWindow)
+            pipeline: pipeline, meeting: meeting, mainWindow: mainWindow,
+            settingsWindow: settingsWindow)
         // Embed anything new shortly after each store, so search stays fresh.
         pipeline.onDictationStored = { [weak knowledge] in knowledge?.indexSoon() }
         meeting.onMeetingStored = { [weak knowledge] in knowledge?.indexSoon() }

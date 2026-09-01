@@ -2,10 +2,15 @@
 import PackageDescription
 
 // The Rust core is linked as a static archive produced by
-// `cargo build --release -p hark-core` at the workspace root; the UniFFI
+// `cargo build --release -p hark-core` at the workspace root and then
+// post-processed by scripts/localize-hark-core-ffi.sh into an FFI-only
+// archive (only the _uniffi_/_ffi_ symbols stay exported — the raw
+// staticlib's Rust std otherwise collides with the Rust std bundled in
+// FluidAudio's prebuilt NemoTextProcessing xcframework: duplicate
+// `_rust_eh_personality`, a hard error in debug links). The UniFFI
 // bindings (Sources/Hark/Generated + Sources/hark_coreFFI) are emitted by
 // scripts/build-app.sh. Build via that script, not bare `swift build`.
-let harkCoreLib = "../../target/release/libhark_core.a"
+let harkCoreLib = "../../target/release/libhark_core_ffi.a"
 
 let package = Package(
     name: "Hark",

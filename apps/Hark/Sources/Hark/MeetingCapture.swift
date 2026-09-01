@@ -59,6 +59,22 @@ final class MeetingCapture {
     private var startedAt: Date?
     private(set) var isRecording = false
 
+    /// Fires (on the main actor) when a recording is killed from under us —
+    /// today that's a coreaudiod restart (`sudo killall coreaudiod`), which
+    /// silently destroys the tap and aggregate device. The WAV is finalized
+    /// first, so the tuple is exactly what stop() returns and the partial
+    /// file is ready for the normal processing path.
+    var onCaptureLost: ((URL, Date, Date, Float, Float) -> Void)?
+
+    /// System-object listener for kAudioHardwarePropertyServiceRestarted;
+    /// registered for the duration of a recording only.
+    private var restartListenerBlock: AudioObjectPropertyListenerBlock?
+
+    /// Result of the most recent finalization — makes stop() safe/idempotent
+    /// if the controller calls it after a capture-lost finalization already
+    /// ran.
+    private var lastResult: (url: URL, startedAt: Date, endedAt: Date, micPeak: Float, systemPeak: Float)?
+
     // MARK: - Lifecycle
 
     /// Starts a meeting recording. `micDeviceUID` pins the microphone (same
@@ -197,19 +213,41 @@ final class MeetingCapture {
         self.fileURL = url
         self.startedAt = Date()
         isRecording = true
+        installServiceRestartListener()
         harkLog("meeting: recording started -> \(url.path)")
     }
 
     /// Stops the recording, tears down the Core Audio objects (spike order:
     /// stop -> destroy IOProc -> destroy aggregate -> destroy tap), patches
     /// the WAV header, and returns the finished file plus per-channel peaks
-    /// for zero-buffer diagnostics. Only call while `isRecording`.
+    /// for zero-buffer diagnostics.
+    ///
+    /// Safe to call after a capture loss (audio-server restart) already
+    /// finalized the recording: it logs and returns the finalized result
+    /// instead of crashing.
     func stop() -> (url: URL, startedAt: Date, endedAt: Date, micPeak: Float, systemPeak: Float) {
-        precondition(isRecording, "MeetingCapture.stop() called while not recording")
+        guard isRecording else {
+            if let lastResult {
+                harkLog("meeting: stop() called after the recording was already finalized (capture lost) — returning the finalized result.")
+                return lastResult
+            }
+            // Never recorded at all: keep the old contract loudly rather
+            // than fabricating a file that doesn't exist.
+            preconditionFailure("MeetingCapture.stop() called while not recording")
+        }
+        return finalize()
+    }
+
+    /// Shared teardown/finalization for both the user-initiated stop() and
+    /// the capture-lost path. Only call while `isRecording`.
+    private func finalize() -> (url: URL, startedAt: Date, endedAt: Date, micPeak: Float, systemPeak: Float) {
         let io = self.io!
         let url = self.fileURL!
         let started = self.startedAt!
 
+        removeServiceRestartListener()
+        // After a coreaudiod restart these IDs are dead and the calls return
+        // errors — harmless; the objects died with the server.
         if let procID {
             AudioDeviceStop(aggregateID, procID)
         }
@@ -250,13 +288,72 @@ final class MeetingCapture {
         self.startedAt = nil
         isRecording = false
 
-        return (url, started, endedAt, stats.micPeak, stats.systemPeak)
+        let result = (url, started, endedAt, stats.micPeak, stats.systemPeak)
+        lastResult = result
+        return result
     }
 
     /// Best-effort teardown for app exit while a recording is running.
     func teardown() {
         guard isRecording else { return }
         _ = stop()
+    }
+
+    // MARK: - coreaudiod-restart resilience
+
+    private nonisolated static var serviceRestartedAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyServiceRestarted,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+    }
+
+    /// A coreaudiod restart destroys our process tap and aggregate device
+    /// with no per-object notification — the recording just stops producing
+    /// callbacks. Listen on the system object for the restart and finalize
+    /// the WAV cleanly (everything captured so far is preserved).
+    private func installServiceRestartListener() {
+        guard restartListenerBlock == nil else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            // Dispatched on the main queue (listener registration below).
+            MainActor.assumeIsolated {
+                self?.handleAudioServerRestart()
+            }
+        }
+        var address = Self.serviceRestartedAddress
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
+        if status == noErr {
+            restartListenerBlock = block
+        } else {
+            harkLog("meeting: WARNING — could not install the audio-server restart listener (OSStatus \(status)).")
+        }
+    }
+
+    private func removeServiceRestartListener() {
+        guard let block = restartListenerBlock else { return }
+        var address = Self.serviceRestartedAddress
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
+        restartListenerBlock = nil
+    }
+
+    /// Runs on the main actor. Re-entrancy-safe: the first event finalizes
+    /// and flips isRecording, so a restart storm's follow-up notifications
+    /// fall through the guard.
+    private func handleAudioServerRestart() {
+        guard isRecording else { return }
+        harkLog("meeting: audio server restarted — the tap/aggregate device are gone; finalizing the file.")
+        let result = finalize()
+        harkLog("meeting: recording stopped by an audio-server restart — partial recording kept at \(result.url.path)")
+        onCaptureLost?(result.url, result.startedAt, result.endedAt, result.micPeak, result.systemPeak)
+    }
+
+    /// Test seam: invokes the capture-lost path exactly as the HAL listener
+    /// would (already on the main actor). `sudo killall coreaudiod` is the
+    /// live equivalent.
+    func simulateAudioServerRestart() {
+        handleAudioServerRestart()
     }
 
     /// Idempotent destruction of the tap/aggregate/proc in the verified

@@ -3,8 +3,8 @@ import Observation
 import SwiftUI
 
 // The management window: browse/search meetings & dictations, organize them
-// into projects, and ask questions over them. Hark stays a menu-bar app; this
-// window promotes it to a regular (Dock-visible) app only while it's open.
+// into projects, and ask questions over them. Hark stays a menu-bar-only app
+// (.accessory) even while this window is open — one icon total, the bird.
 
 // MARK: - Formatting helpers
 
@@ -384,11 +384,11 @@ final class HarkMainWindow: NSWindow {
     }
 }
 
-/// Single reusable management window. `show()` promotes the app to a regular
-/// Dock-visible app; closing the window (it's the app's only real window)
-/// drops back to the menu-bar-only .accessory policy.
+/// Single reusable management window. The app stays .accessory (menu-bar
+/// only, no Dock icon) — accessory apps can still take key focus, and the
+/// window handles its own ⌘-key equivalents (see HarkMainWindow above).
 @MainActor
-final class MainWindowController: NSWindowController, NSWindowDelegate {
+final class MainWindowController: NSWindowController {
     private let model: KnowledgeModel
 
     init(knowledge: KnowledgeService) {
@@ -404,7 +404,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window.setFrameAutosaveName("HarkMainWindow")
         window.contentView = NSHostingView(rootView: MainWindowRootView(model: model))
         super.init(window: window)
-        window.delegate = self
     }
 
     @available(*, unavailable)
@@ -412,16 +411,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Opens (or raises) the window and brings Hark to the foreground.
     func show() {
-        NSApp.setActivationPolicy(.regular)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         model.refreshAll()
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        // Last (only) real window is closing: back to menu-bar-only. The
-        // status item, hotkey, and HUD are unaffected.
-        NSApp.setActivationPolicy(.accessory)
     }
 }
 

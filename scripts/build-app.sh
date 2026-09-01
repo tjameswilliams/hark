@@ -11,13 +11,22 @@ REPO_ROOT="$(pwd)"
 # toolchain built libstd against a newer SDK — harmless (same as the spike).
 export MACOSX_DEPLOYMENT_TARGET=15.0
 
-echo "==> [1/5] cargo build --release -p hark-core"
-cargo build --release -p hark-core
+echo "==> [1/6] cargo build --release -p hark-core -p hark-mcp"
+cargo build --release -p hark-core -p hark-mcp
 
 LIB="target/release/libhark_core.a"
 [ -f "$LIB" ] || { echo "error: $LIB not found"; exit 1; }
+MCP_BIN="target/release/hark-mcp"
+[ -f "$MCP_BIN" ] || { echo "error: $MCP_BIN not found"; exit 1; }
 
-echo "==> [2/5] uniffi-bindgen-swift: Swift sources + FFI header + modulemap"
+# Localize the staticlib to its FFI surface (libhark_core_ffi.a) — this is
+# what Package.swift links. Fixes the duplicate `_rust_eh_personality`
+# against FluidAudio's prebuilt NemoTextProcessing xcframework (which
+# bundles its own Rust std); see the script header for details.
+echo "==> [2/6] localize hark-core staticlib (FFI-only exports)"
+scripts/localize-hark-core-ffi.sh
+
+echo "==> [3/6] uniffi-bindgen-swift: Swift sources + FFI header + modulemap"
 GEN="apps/Hark/.uniffi-generated"
 rm -rf "$GEN"
 mkdir -p "$GEN"
@@ -37,14 +46,19 @@ cp "$GEN"/*.h apps/Hark/Sources/hark_coreFFI/
 cp "$GEN"/module.modulemap apps/Hark/Sources/hark_coreFFI/module.modulemap
 rm -rf "$GEN"
 
-echo "==> [3/5] swift build -c release (apps/Hark)"
+echo "==> [4/6] swift build -c release (apps/Hark)"
 (cd apps/Hark && swift build -c release)
 
-echo "==> [4/5] assembling build/Hark.app"
+echo "==> [5/6] assembling build/Hark.app"
 APP="build/Hark.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp apps/Hark/.build/release/Hark "$APP/Contents/MacOS/Hark"
+# Bundle the MCP server next to the main executable: the settings screen
+# invokes it via Bundle.main.executableURL
+#   .deletingLastPathComponent().appendingPathComponent("hark-mcp")
+# i.e. exactly Contents/MacOS/hark-mcp.
+cp "$MCP_BIN" "$APP/Contents/MacOS/hark-mcp"
 cp apps/Hark/Support/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
@@ -60,15 +74,23 @@ if [ -z "$IDENTITY" ]; then
         | sed -E 's/.*"(.*)".*/\1/' || true)
 fi
 if [ -n "$IDENTITY" ]; then
-    echo "==> [5/5] codesign ($IDENTITY)"
-    codesign --force --deep --sign "$IDENTITY" "$APP"
+    echo "==> [6/6] codesign ($IDENTITY)"
+    SIGN=(--sign "$IDENTITY")
 else
-    echo "==> [5/5] codesign (ad-hoc — no Developer ID identity found)"
-    codesign --force --deep -s - "$APP"
+    echo "==> [6/6] codesign (ad-hoc — no Developer ID identity found)"
+    SIGN=(-s -)
 fi
+# Sign the nested hark-mcp binary explicitly first (auxiliary executables in
+# Contents/MacOS are NOT reliably covered by --deep, which only walks nested
+# code in standard locations), then the app bundle.
+codesign --force "${SIGN[@]}" "$APP/Contents/MacOS/hark-mcp"
+codesign --force --deep "${SIGN[@]}" "$APP"
+codesign --verify --deep --strict "$APP"
+codesign --verify --strict "$APP/Contents/MacOS/hark-mcp"
 
 echo ""
 echo "Build complete: $REPO_ROOT/$APP"
+echo "MCP server:     $REPO_ROOT/$APP/Contents/MacOS/hark-mcp"
 echo ""
 echo "Run it with:"
 echo "  open build/Hark.app"

@@ -20,3 +20,4 @@ xcuserdata/
 *.sqlite-wal
 *.sqlite-shm
 .env
+.build-*/

@@ -144,23 +144,49 @@ final class MicCapture {
     private var boundSampleRate: Double = 0
     private var boundChannels = 0
 
+    // MARK: - coreaudiod-restart / device-death resilience state
+
+    /// System-object listener for kAudioHardwarePropertyServiceRestarted;
+    /// installed once on first warm-up, lives for the app's lifetime.
+    private var restartListenerBlock: AudioObjectPropertyListenerBlock?
+    /// Per-device listener for kAudioDevicePropertyDeviceIsAlive; re-added on
+    /// every warm-up (the bound device changes) and removed in teardown so
+    /// listeners never leak across re-warms.
+    private var aliveListenerBlock: AudioObjectPropertyListenerBlock?
+    private var aliveListenerDevice = AudioDeviceID(kAudioObjectUnknown)
+    /// Debounce for restart storms: at most one re-warm scheduled at a time,
+    /// executed ~1 s after the first trigger (coalesces the multiple
+    /// notifications a coreaudiod restart fires).
+    private var rewarmScheduled = false
+    /// True from warmUp() until an explicit teardown(): the re-warm handlers
+    /// use this (not `isWarm`) so a failed re-warm attempt can still be
+    /// retried on the next restart notification.
+    private var wantsWarm = false
+
     /// Resolves the capture device, creates its IOProc, and starts IO. The
     /// first call in a fresh TCC grant state triggers the microphone
     /// permission prompt (attributed to Hark via its Info.plist usage
     /// description). Returns warm-up wall time in ms.
-    func warmUp() throws -> Double {
+    ///
+    /// `ignorePinned` skips the pinned-UID preference for this warm-up only
+    /// (used when the pinned device died mid-session and we fall back to the
+    /// system default).
+    func warmUp(ignorePinned: Bool = false) throws -> Double {
         let start = ContinuousClock.now
 
         if isWarm { teardown() }
+        wantsWarm = true
+        installServiceRestartListener()
 
         // Resolve device: the pinned UID when present, else the system
         // default. Falls back to the default when the pinned device is
         // unplugged/missing.
         let device: AudioInputDevice
-        if let uid = pinnedDeviceUID, let pinned = AudioInputDevices.device(forUID: uid) {
+        if !ignorePinned, let uid = pinnedDeviceUID,
+           let pinned = AudioInputDevices.device(forUID: uid) {
             device = pinned
         } else {
-            if pinnedDeviceUID != nil {
+            if pinnedDeviceUID != nil, !ignorePinned {
                 harkLog("pinned input device not present — using system default.")
             }
             guard let fallback = AudioInputDevices.defaultInput() else {
@@ -222,7 +248,156 @@ final class MicCapture {
         boundSampleRate = sampleRate
         boundChannels = channels
         isWarm = true
+        installDeviceAliveListener(on: device.id)
         return (ContinuousClock.now - start).millisecondsValue
+    }
+
+    // MARK: - coreaudiod-restart / device-death resilience
+
+    private nonisolated static var serviceRestartedAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyServiceRestarted,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private nonisolated static var deviceIsAliveAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+    }
+
+    /// Installed once, on the system object, for the app's lifetime. If
+    /// coreaudiod is killed/restarted (`sudo killall coreaudiod` happens in
+    /// the field), every IOProc dies silently — this is the only signal.
+    private func installServiceRestartListener() {
+        guard restartListenerBlock == nil else { return }
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            // Dispatched on the main queue (listener registration below).
+            MainActor.assumeIsolated {
+                self?.handleAudioServerRestart()
+            }
+        }
+        var address = Self.serviceRestartedAddress
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
+        if status == noErr {
+            restartListenerBlock = block
+        } else {
+            harkLog("mic: WARNING — could not install the audio-server restart listener (OSStatus \(status)); a coreaudiod restart will require a manual re-warm.")
+        }
+    }
+
+    /// Watches the bound device: if it disappears mid-session (unplugged USB
+    /// mic, Bluetooth drop), re-warm onto the system default. Removed and
+    /// re-added per warm-up so listeners never accumulate.
+    private func installDeviceAliveListener(on device: AudioDeviceID) {
+        removeDeviceAliveListener()
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                self?.handleDeviceAliveChanged()
+            }
+        }
+        var address = Self.deviceIsAliveAddress
+        let status = AudioObjectAddPropertyListenerBlock(device, &address, .main, block)
+        if status == noErr {
+            aliveListenerBlock = block
+            aliveListenerDevice = device
+        } else {
+            harkLog("mic: WARNING — could not watch device liveness (OSStatus \(status)).")
+        }
+    }
+
+    private func removeDeviceAliveListener() {
+        guard let block = aliveListenerBlock,
+              aliveListenerDevice != AudioDeviceID(kAudioObjectUnknown)
+        else { return }
+        var address = Self.deviceIsAliveAddress
+        // Best-effort: after a coreaudiod restart the old device ID is gone
+        // and this returns an error — that's fine, the registration died with
+        // the server.
+        AudioObjectRemovePropertyListenerBlock(aliveListenerDevice, &address, .main, block)
+        aliveListenerBlock = nil
+        aliveListenerDevice = AudioDeviceID(kAudioObjectUnknown)
+    }
+
+    private func handleAudioServerRestart() {
+        guard wantsWarm else { return }
+        scheduleRewarm(reason: "audio server restarted", ignorePinned: false)
+    }
+
+    private func handleDeviceAliveChanged() {
+        guard wantsWarm else { return }
+        // The property can fire without the device dying; only act when it
+        // is actually gone (or can no longer be queried).
+        guard !Self.deviceIsAlive(aliveListenerDevice) else { return }
+        scheduleRewarm(
+            reason: "input device '\(activeDeviceName)' disappeared",
+            ignorePinned: true)
+    }
+
+    /// Coalesces re-warm triggers: the first one schedules a re-warm ~1 s
+    /// out; anything arriving meanwhile (restart storms fire several
+    /// notifications) is absorbed. The delay also gives the HAL time to
+    /// repopulate its device list after a server restart.
+    private func scheduleRewarm(reason: String, ignorePinned: Bool) {
+        guard !rewarmScheduled else { return }
+        rewarmScheduled = true
+        harkLog("mic: \(reason) — re-warming in 1 s.")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.rewarmScheduled = false
+                self.performRewarm(reason: reason, ignorePinned: ignorePinned)
+            }
+        }
+    }
+
+    private func performRewarm(reason: String, ignorePinned: Bool) {
+        guard wantsWarm else { return }  // torn down while debouncing
+        do {
+            let ms = try warmUp(ignorePinned: ignorePinned)
+            if ignorePinned {
+                harkLog(String(
+                    format: "mic: input device lost — re-warmed onto fallback '%@' in %.1f ms (%@)",
+                    activeDeviceName, ms, inputDescription))
+            } else {
+                harkLog(String(
+                    format: "audio server restarted — mic engine re-warmed in %.1f ms (%@)",
+                    ms, inputDescription))
+            }
+        } catch {
+            // wantsWarm stays true: the next restart/death notification (or
+            // an explicit warmUp) gets another shot.
+            harkLog("mic: re-warm after '\(reason)' FAILED: \(error)")
+        }
+    }
+
+    private nonisolated static func deviceIsAlive(_ id: AudioDeviceID) -> Bool {
+        guard id != AudioDeviceID(kAudioObjectUnknown) else { return false }
+        var address = deviceIsAliveAddress
+        var alive: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &alive) == noErr else {
+            return false  // can't even query it — treat as dead
+        }
+        return alive != 0
+    }
+
+    /// Test seam: invokes the coreaudiod-restart path exactly as the HAL
+    /// listener would (already on the main actor). Used by the resilience
+    /// harness; sudo-killing coreaudiod is the live equivalent.
+    func simulateAudioServerRestart() {
+        handleAudioServerRestart()
+    }
+
+    /// Test seam for the device-death path.
+    func simulateDeviceDeath() {
+        guard wantsWarm else { return }
+        scheduleRewarm(
+            reason: "input device '\(activeDeviceName)' disappeared (simulated)",
+            ignorePinned: true)
     }
 
     /// Runs on the IO queue — deliberately built outside any actor context so
@@ -325,7 +500,12 @@ final class MicCapture {
     }
 
     func teardown() {
+        // An explicit teardown always cancels the desire to stay warm (a
+        // re-warm scheduled behind a debounce checks wantsWarm before
+        // acting). warmUp() re-sets it right after calling teardown().
+        wantsWarm = false
         guard isWarm else { return }
+        removeDeviceAliveListener()
         // Stop IO before destroying the proc (AudioTapSpike ordering), then
         // drain any in-flight IO callback so the converter box is quiescent
         // before a subsequent warmUp() builds a new one.

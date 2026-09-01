@@ -44,6 +44,21 @@ final class MeetingController {
 
     init(storeProvider: @escaping () -> HarkStore?) {
         self.storeProvider = storeProvider
+        // An audio-server restart mid-meeting kills the tap; MeetingCapture
+        // finalizes the partial WAV and hands it here — process it exactly
+        // like a normal stop so nothing recorded is ever lost.
+        capture.onCaptureLost = { [weak self] url, startedAt, endedAt, micPeak, systemPeak in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.state = .idle
+                    harkLog(String(
+                        format: "meeting: capture lost — peaks mic %.4f, system %.4f. processing partial %@ …",
+                        micPeak, systemPeak, url.lastPathComponent))
+                    self.processRecording(url: url, startedAt: startedAt, endedAt: endedAt)
+                }
+            }
+        }
     }
 
     // MARK: - Recording
@@ -73,24 +88,30 @@ final class MeetingController {
             format: "meeting: peaks — mic %.4f, system %.4f. processing %@ …",
             result.micPeak, result.systemPeak, result.url.lastPathComponent))
 
+        processRecording(url: result.url, startedAt: result.startedAt, endedAt: result.endedAt)
+    }
+
+    /// Shared post-capture path (normal stop AND capture-lost recovery):
+    /// diarize + transcribe in the background, then persist.
+    private func processRecording(url: URL, startedAt: Date, endedAt: Date) {
         let titleFormatter = DateFormatter()
         titleFormatter.dateFormat = "yyyy-MM-dd HH:mm"
-        let title = "Meeting \(titleFormatter.string(from: result.startedAt))"
-        let startedAt = isoFormatter.string(from: result.startedAt)
-        let endedAt = isoFormatter.string(from: result.endedAt)
+        let title = "Meeting \(titleFormatter.string(from: startedAt))"
+        let startedAtISO = isoFormatter.string(from: startedAt)
+        let endedAtISO = isoFormatter.string(from: endedAt)
 
         processingCount += 1
         Task { @MainActor in
             defer { self.processingCount -= 1 }
             do {
                 let utterances = try await MeetingProcessor.process(
-                    fileURL: result.url,
+                    fileURL: url,
                     progress: { line in harkLog("meeting: \(line)") })
                 self.persist(
-                    title: title, startedAt: startedAt, endedAt: endedAt,
-                    audioPath: result.url.path, utterances: utterances)
+                    title: title, startedAt: startedAtISO, endedAt: endedAtISO,
+                    audioPath: url.path, utterances: utterances)
             } catch {
-                harkLog("meeting: processing FAILED (\(error)) — recording kept at \(result.url.path)")
+                harkLog("meeting: processing FAILED (\(error)) — recording kept at \(url.path)")
             }
         }
     }

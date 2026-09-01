@@ -12,6 +12,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let pipeline: DictationPipeline
     private let meeting: MeetingController
     private let mainWindow: MainWindowController
+    private let settingsWindow: SettingsWindowController
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
 
@@ -31,10 +32,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let relativeFormatter = RelativeDateTimeFormatter()
     private let isoParser = ISO8601DateFormatter()
 
-    init(pipeline: DictationPipeline, meeting: MeetingController, mainWindow: MainWindowController) {
+    init(
+        pipeline: DictationPipeline, meeting: MeetingController,
+        mainWindow: MainWindowController, settingsWindow: SettingsWindowController
+    ) {
         self.pipeline = pipeline
         self.meeting = meeting
         self.mainWindow = mainWindow
+        self.settingsWindow = settingsWindow
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
@@ -44,7 +49,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             ?? NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hark")
         image?.isTemplate = true
         statusItem.button?.image = image
-        statusItem.button?.toolTip = "Hark — hold right ⌘ to dictate"
+        statusItem.button?.toolTip = pipeline.tooltip
 
         menu.autoenablesItems = false
         menu.delegate = self
@@ -91,6 +96,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(meetingsItem)
         menu.addItem(.separator())
 
+        let settingsItem = NSMenuItem(
+            title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let permissionsItem = NSMenuItem(
             title: "Permissions…", action: #selector(showPermissions), keyEquivalent: "")
         permissionsItem.target = self
@@ -103,8 +113,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         statusItem.menu = menu
 
-        pipeline.onStateChange = { [weak self] state in
-            self?.statusLine.title = state.label
+        pipeline.onStateChange = { [weak self] _ in
+            guard let self else { return }
+            // statusLabel folds in the configured hotkey and mic parking;
+            // the callback also fires on hotkey/parking changes.
+            self.statusLine.title = self.pipeline.statusLabel
+            self.statusItem.button?.toolTip = self.pipeline.tooltip
         }
         meeting.onStateChange = { [weak self] state in
             self?.meetingStateChanged(state)
@@ -121,7 +135,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // Opening the menu is also a natural moment to retry the event tap
         // (e.g. the user just granted Accessibility).
         pipeline.attemptTapInstall()
-        statusLine.title = pipeline.state.label
+        statusLine.title = pipeline.statusLabel
+        statusItem.button?.toolTip = pipeline.tooltip
         cleanupLine.title = pipeline.cleanupDescription
         enableItem.state = pipeline.dictationEnabled ? .on : .off
         rebuildRecentSubmenu()
@@ -272,6 +287,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func openMainWindow() {
         mainWindow.show()
+    }
+
+    @objc private func openSettings() {
+        settingsWindow.show()
     }
 
     @objc private func toggleDictation(_ sender: NSMenuItem) {
