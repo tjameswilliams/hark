@@ -11,6 +11,7 @@ import Foundation
 final class StatusItemController: NSObject, NSMenuDelegate {
     private let pipeline: DictationPipeline
     private let meeting: MeetingController
+    private let mainWindow: MainWindowController
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
 
@@ -30,9 +31,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let relativeFormatter = RelativeDateTimeFormatter()
     private let isoParser = ISO8601DateFormatter()
 
-    init(pipeline: DictationPipeline, meeting: MeetingController) {
+    init(pipeline: DictationPipeline, meeting: MeetingController, mainWindow: MainWindowController) {
         self.pipeline = pipeline
         self.meeting = meeting
+        self.mainWindow = mainWindow
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
@@ -47,6 +49,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.autoenablesItems = false
         menu.delegate = self
         recentSubmenu.autoenablesItems = false
+
+        // Management window (browse/search/ask), above the dictation status.
+        let openItem = NSMenuItem(
+            title: "Open Hark…", action: #selector(openMainWindow), keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
+        menu.addItem(.separator())
 
         statusLine.isEnabled = false
         menu.addItem(statusLine)
@@ -260,6 +269,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     // MARK: - Actions
+
+    @objc private func openMainWindow() {
+        mainWindow.show()
+    }
 
     @objc private func toggleDictation(_ sender: NSMenuItem) {
         pipeline.setDictationEnabled(!pipeline.dictationEnabled)

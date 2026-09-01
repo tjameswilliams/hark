@@ -1,5 +1,6 @@
 pub mod db;
 pub mod ffi;
+pub mod knowledge;
 pub mod models;
 
 pub use db::Db;

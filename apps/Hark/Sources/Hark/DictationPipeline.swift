@@ -96,6 +96,8 @@ final class DictationPipeline: NSObject {
 
     /// Fires on every state change; the status item mirrors it into the menu.
     var onStateChange: ((PipelineState) -> Void)?
+    /// Fires after a dictation is persisted (used to kick background indexing).
+    var onDictationStored: (() -> Void)?
     private(set) var state: PipelineState = .loadingModels {
         didSet { if state != oldValue { onStateChange?(state) } }
     }
@@ -564,6 +566,7 @@ final class DictationPipeline: NSObject {
                 endedAt: isoFormatter.string(from: endedAt),
                 durationMs: durationMs)
             harkLog("dictation #\(id) stored.")
+            onDictationStored?()
         } catch {
             harkLog("WARNING: failed to store dictation (paste unaffected): \(error)")
         }

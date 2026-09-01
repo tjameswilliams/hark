@@ -1,7 +1,26 @@
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::Once;
 
 use crate::Result;
+
+/// Registers sqlite-vec's `sqlite3_vec_init` as an auto-extension so every
+/// connection opened afterwards (including migration runs) has the `vec0`
+/// virtual-table module. Statically linked — no dylib loading, which matters
+/// for notarization. Process-global and idempotent via `Once`.
+fn register_sqlite_vec() {
+    static VEC_REGISTERED: Once = Once::new();
+    type AutoExtFn = unsafe extern "C" fn(
+        *mut rusqlite::ffi::sqlite3,
+        *mut *mut std::os::raw::c_char,
+        *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::os::raw::c_int;
+    VEC_REGISTERED.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtFn>(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
 
 /// Schema migrations, applied in order; `user_version` tracks the last one run.
 /// Vector search (sqlite-vec) and embeddings arrive with the knowledge-layer
@@ -90,6 +109,19 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
     END;
     ",
+    // 2: vector index over chunks (sqlite-vec). rowid == chunks.id.
+    // The `+` columns are auxiliary metadata: stored per-row and selectable,
+    // but NOT usable as KNN filter constraints in sqlite-vec 0.1.x — KNN
+    // queries here run unfiltered with an inflated k and post-filter by
+    // joining chunks/sessions (see knowledge.rs).
+    "
+    CREATE VIRTUAL TABLE chunk_embeddings USING vec0(
+        embedding float[384],
+        +model_id TEXT,
+        +session_id INTEGER,
+        +project_id INTEGER
+    );
+    ",
 ];
 
 pub struct Db {
@@ -98,11 +130,13 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        register_sqlite_vec();
         let conn = Connection::open(path)?;
         Self::init(conn)
     }
 
     pub fn open_in_memory() -> Result<Self> {
+        register_sqlite_vec();
         Self::init(Connection::open_in_memory()?)
     }
 
@@ -179,5 +213,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    /// vec0 is statically linked and supports what knowledge.rs relies on:
+    /// blob insert with rowid + aux columns, `k = ?` KNN, and UPDATE of aux
+    /// columns addressed by rowid.
+    #[test]
+    fn vec0_roundtrip_knn_and_aux_update() {
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        let to_blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let a = to_blob(&{
+            let mut v = [0.0f32; 384];
+            v[0] = 1.0;
+            v
+        });
+        let b = to_blob(&{
+            let mut v = [0.0f32; 384];
+            v[1] = 1.0;
+            v
+        });
+        conn.execute(
+            "INSERT INTO chunk_embeddings (rowid, embedding, model_id, session_id, project_id)
+             VALUES (1, ?1, 'test', 1, 0)",
+            [&a],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_embeddings (rowid, embedding, model_id, session_id, project_id)
+             VALUES (2, ?1, 'test', 2, 0)",
+            [&b],
+        )
+        .unwrap();
+
+        // KNN: nearest to `a` is rowid 1.
+        let nearest: i64 = conn
+            .query_row(
+                "SELECT rowid FROM chunk_embeddings WHERE embedding MATCH ?1 AND k = 1",
+                [&a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nearest, 1);
+
+        // Aux column UPDATE by rowid.
+        conn.execute(
+            "UPDATE chunk_embeddings SET project_id = 7 WHERE rowid = 1",
+            [],
+        )
+        .unwrap();
+        let pid: i64 = conn
+            .query_row(
+                "SELECT project_id FROM chunk_embeddings WHERE rowid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pid, 7);
     }
 }

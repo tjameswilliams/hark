@@ -14,3 +14,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Statically linked vec0 extension; registered via sqlite3_auto_extension in hark-core::db.
+sqlite-vec = "0.1.6"
+# CPU-only ONNX embeddings (BGESmallENV15). Default features minus image-models;
+# no GPU execution providers.
+fastembed = { version = "6", default-features = false, features = [
+    "ort-download-binaries-native-tls",
+    "hf-hub-native-tls",
+] }

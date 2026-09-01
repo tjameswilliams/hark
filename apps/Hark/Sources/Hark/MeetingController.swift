@@ -22,6 +22,8 @@ final class MeetingController {
 
     /// Fires on every state change; the status item mirrors it into the menu.
     var onStateChange: ((MeetingState) -> Void)?
+    /// Fires after a meeting transcript is persisted (kicks background indexing).
+    var onMeetingStored: (() -> Void)?
     private(set) var state: MeetingState = .idle {
         didSet { if state != oldValue { onStateChange?(state) } }
     }
@@ -128,6 +130,7 @@ final class MeetingController {
                 audioPath: audioPath,
                 segments: segments)
             harkLog("meeting: #\(id) stored (\(segments.count) segment(s)).")
+            onMeetingStored?()
         } catch {
             harkLog("meeting: WARNING — failed to store the transcript (\(error)); recording kept at \(audioPath)")
         }

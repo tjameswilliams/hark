@@ -22,4 +22,9 @@ rusqlite = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlite-vec = { workspace = true }
+fastembed = { workspace = true }
 uniffi = "0.32"
+
+[dev-dependencies]
+rusqlite = { workspace = true }
