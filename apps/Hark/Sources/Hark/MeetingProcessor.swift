@@ -12,15 +12,44 @@ import Foundation
 @MainActor
 final class MeetingProcessor {
 
+    /// Injectable dictionary source for deterministic replacements on
+    /// utterance texts — meetings deserve correct names too. Set once at
+    /// startup (DictationPipeline.start() points it at the store); nil means
+    /// no replacements. Written once before any processing happens and read
+    /// from the pipeline task, hence nonisolated(unsafe); the closure itself
+    /// must be @Sendable.
+    nonisolated(unsafe) static var replacementProvider: (@Sendable () -> [DictionaryEntry])?
+
     /// Processes a recorded meeting audio file (WAV; 16 kHz 16-bit mono
     /// expected, but any AVAudioFile-readable format/rate/channel-count is
     /// converted — stereo is averaged to mono) into speaker-attributed,
     /// time-stamped utterances.
+    ///
+    /// `replacements` overrides the dictionary-backed default engine; the
+    /// default (nil) consults `replacementProvider`, so existing callers get
+    /// dictionary corrections with no signature change.
     static func process(
         fileURL: URL,
+        replacements: ReplacementEngine? = nil,
         progress: @escaping @Sendable (String) -> Void
     ) async throws -> [MeetingUtterance] {
-        try await runPipeline(fileURL: fileURL, progress: progress)
+        let utterances = try await runPipeline(fileURL: fileURL, progress: progress)
+        let engine = replacements ?? Self.replacementProvider.map { ReplacementEngine(entries: $0()) }
+        guard let engine, !engine.isEmpty else { return utterances }
+        return utterances.map { utterance in
+            let corrected = engine.applyReporting(utterance.text)
+            for hit in corrected.fired {
+                harkLog("dictionary (meeting): \(hit.alias) -> \(hit.term)")
+            }
+            guard corrected.text != utterance.text else { return utterance }
+            return MeetingUtterance(
+                speakerLabel: utterance.speakerLabel,
+                tStartMs: utterance.tStartMs,
+                tEndMs: utterance.tEndMs,
+                text: corrected.text,
+                confidence: utterance.confidence
+            )
+        }
     }
 
     // MARK: - Pipeline (off the main actor)

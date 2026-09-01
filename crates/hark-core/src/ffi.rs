@@ -132,6 +132,32 @@ impl HarkStore {
 
 /// Guard for write paths: read-only stores refuse cleanly rather than
 /// surfacing a raw SQLITE_READONLY error (or worse, a panic).
+/// A user-dictionary entry: the canonical spelling plus known wrong spellings
+/// ("aliases"), e.g. term "Ayesha", aliases ["Aisha"].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DictionaryEntry {
+    pub id: i64,
+    pub term: String,
+    pub aliases: Vec<String>,
+    pub enabled: bool,
+}
+
+/// Trims, drops empties, dedups (case-insensitive), and removes any alias
+/// equal to the term itself.
+fn normalized_aliases(term: &str, aliases: Vec<String>) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for alias in aliases {
+        let alias = alias.trim();
+        if alias.is_empty() || alias.eq_ignore_ascii_case(term) {
+            continue;
+        }
+        if !seen.iter().any(|existing| existing.eq_ignore_ascii_case(alias)) {
+            seen.push(alias.to_owned());
+        }
+    }
+    seen
+}
+
 fn check_writable(db: &Db) -> Result<(), HarkError> {
     if db.is_read_only() {
         return Err(HarkError::Failure(
@@ -347,6 +373,80 @@ impl HarkStore {
             "DELETE FROM sessions WHERE id = ?1 AND kind = 'dictation'",
             [id],
         )?;
+        Ok(())
+    }
+
+    // -- Dictionary ----------------------------------------------------------
+
+    /// All dictionary entries, alphabetical by term (disabled ones included —
+    /// the UI shows them greyed out).
+    pub fn list_dictionary(&self) -> Result<Vec<DictionaryEntry>, HarkError> {
+        let db = self.db.lock().expect("hark db lock poisoned");
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, term, aliases, enabled FROM dictionary ORDER BY term COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let aliases_json: String = row.get(2)?;
+            Ok(DictionaryEntry {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
+                enabled: row.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Adds a term (canonical spelling) with known wrong spellings. Errors on
+    /// a duplicate term. Returns the new entry id.
+    pub fn add_dictionary_term(
+        &self,
+        term: String,
+        aliases: Vec<String>,
+    ) -> Result<i64, HarkError> {
+        let term = term.trim().to_owned();
+        if term.is_empty() {
+            return Err(HarkError::Failure("dictionary term cannot be empty".into()));
+        }
+        let db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        let aliases_json =
+            serde_json::to_string(&normalized_aliases(&term, aliases)).unwrap_or_else(|_| "[]".into());
+        db.conn().execute(
+            "INSERT INTO dictionary (term, aliases) VALUES (?1, ?2)",
+            rusqlite::params![term, aliases_json],
+        )?;
+        Ok(db.conn().last_insert_rowid())
+    }
+
+    /// Replaces a dictionary entry's term, aliases, and enabled flag.
+    pub fn update_dictionary_term(
+        &self,
+        id: i64,
+        term: String,
+        aliases: Vec<String>,
+        enabled: bool,
+    ) -> Result<(), HarkError> {
+        let term = term.trim().to_owned();
+        if term.is_empty() {
+            return Err(HarkError::Failure("dictionary term cannot be empty".into()));
+        }
+        let db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        let aliases_json =
+            serde_json::to_string(&normalized_aliases(&term, aliases)).unwrap_or_else(|_| "[]".into());
+        db.conn().execute(
+            "UPDATE dictionary SET term = ?2, aliases = ?3, enabled = ?4 WHERE id = ?1",
+            rusqlite::params![id, term, aliases_json, enabled as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_dictionary_term(&self, id: i64) -> Result<(), HarkError> {
+        let db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        db.conn().execute("DELETE FROM dictionary WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -860,6 +960,42 @@ mod tests {
 
         store.delete_dictation(id).unwrap();
         assert_eq!(store.dictation_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn dictionary_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("hark-ffi-dict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        let store = HarkStore::open(path.to_string_lossy().into_owned()).unwrap();
+        let id = store
+            .add_dictionary_term(
+                "Ayesha".into(),
+                vec!["Aisha".into(), " aisha ".into(), "Ayesha".into(), "".into()],
+            )
+            .unwrap();
+
+        let entries = store.list_dictionary().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].term, "Ayesha");
+        // Deduped case-insensitively, trimmed, term itself excluded.
+        assert_eq!(entries[0].aliases, vec!["Aisha".to_string()]);
+        assert!(entries[0].enabled);
+
+        // Duplicate terms are rejected.
+        assert!(store.add_dictionary_term("Ayesha".into(), vec![]).is_err());
+
+        store
+            .update_dictionary_term(id, "Ayesha".into(), vec!["Aiesha".into()], false)
+            .unwrap();
+        let entries = store.list_dictionary().unwrap();
+        assert_eq!(entries[0].aliases, vec!["Aiesha".to_string()]);
+        assert!(!entries[0].enabled);
+
+        store.delete_dictionary_term(id).unwrap();
+        assert!(store.list_dictionary().unwrap().is_empty());
     }
 
     #[test]

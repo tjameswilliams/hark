@@ -122,6 +122,19 @@ const MIGRATIONS: &[&str] = &[
         +project_id INTEGER
     );
     ",
+    // 3: user dictionary — canonical spellings for terms STT/LLM habitually
+    // mangle (names especially). `aliases` is a JSON array of known wrong
+    // spellings; the app feeds terms to the recognizer's vocabulary biasing,
+    // the cleanup prompt, and a deterministic replacement pass.
+    "
+    CREATE TABLE dictionary (
+        id         INTEGER PRIMARY KEY,
+        term       TEXT NOT NULL UNIQUE,
+        aliases    TEXT NOT NULL DEFAULT '[]',
+        enabled    INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    ",
 ];
 
 pub struct Db {

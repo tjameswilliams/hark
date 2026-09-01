@@ -55,6 +55,8 @@ struct SettingsRootView: View {
                 .tabItem { Label("Dictation", systemImage: "mic") }
             CleanupSettingsView(pipeline: pipeline)
                 .tabItem { Label("Cleanup", systemImage: "wand.and.stars") }
+            DictionarySettingsView(pipeline: pipeline)
+                .tabItem { Label("Dictionary", systemImage: "character.book.closed") }
             GeneralSettingsView(pipeline: pipeline)
                 .tabItem { Label("General", systemImage: "gearshape") }
             MCPSettingsView()

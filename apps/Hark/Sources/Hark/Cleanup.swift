@@ -26,6 +26,21 @@ struct TranscriptCleaner: Sendable {
         commentary, quotes, or markdown.
         """
 
+    /// Builds the system prompt, appending the user-dictionary instruction
+    /// when enabled entries exist. The wording is the VoiceInk/openwhispr-
+    /// proven pattern: authoritative spellings, correct only clear matches.
+    static func systemPrompt(dictionary: [DictionaryEntry]) -> String {
+        let terms = dictionary.filter(\.enabled).map(\.term)
+        guard !terms.isEmpty else { return systemPrompt }
+        return systemPrompt + "\n\n" + """
+            User dictionary — these exact spellings are authoritative: \
+            \(terms.joined(separator: ", ")). When the transcript contains a \
+            similar-sounding or phonetically close word that clearly refers \
+            to one of these, correct it to the exact spelling shown. Do not \
+            force a replacement when the text clearly means something else.
+            """
+    }
+
     struct Outcome {
         let text: String
         /// False when the fail-open path returned the original text.
@@ -96,7 +111,9 @@ struct TranscriptCleaner: Sendable {
             timeout: .milliseconds(timeoutMs), reasoning: reasoning)
     }
 
-    func clean(_ text: String) async -> Outcome {
+    /// Cleans a transcript. `dictionary` entries (enabled ones) are injected
+    /// into the system prompt so the model knows the authoritative spellings.
+    func clean(_ text: String, dictionary: [DictionaryEntry] = []) async -> Outcome {
         let start = ContinuousClock.now
         func failOpen(_ reason: String) -> Outcome {
             Outcome(text: text, cleaned: false,
@@ -112,7 +129,7 @@ struct TranscriptCleaner: Sendable {
             "model": model,
             "temperature": 0,
             "messages": [
-                ["role": "system", "content": Self.systemPrompt],
+                ["role": "system", "content": Self.systemPrompt(dictionary: dictionary)],
                 ["role": "user", "content": text],
             ],
         ]

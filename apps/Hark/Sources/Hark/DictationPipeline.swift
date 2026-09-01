@@ -94,6 +94,14 @@ final class DictationPipeline: NSObject {
     /// still dictates, it just doesn't remember).
     private(set) var store: HarkStore?
 
+    /// User dictionary, loaded from the store at start() and re-read by
+    /// reloadDictionary() after every settings mutation. Drives all three
+    /// correction layers: acoustic vocabulary biasing (Transcriber), cleanup
+    /// prompt injection (TranscriptCleaner), and deterministic replacements
+    /// (ReplacementEngine, applied before AND after cleanup).
+    private var dictionaryEntries: [DictionaryEntry] = []
+    private var replacementEngine = ReplacementEngine(entries: [])
+
     private let mic = MicCapture()
     private let pasteEngine = PasteEngine()
     /// Floating HUD capsule (waveform while listening, shimmer while
@@ -156,6 +164,14 @@ final class DictationPipeline: NSObject {
 
     func start() {
         openStore()
+        loadDictionary()
+        // Meetings get the same deterministic replacements as dictations.
+        // The provider reads the store fresh at process time, so dictionary
+        // edits apply to the next meeting without extra plumbing (HarkStore
+        // is Sendable — its DB handle is mutex-guarded in Rust).
+        if let store {
+            MeetingProcessor.replacementProvider = { (try? store.listDictionary()) ?? [] }
+        }
         mic.pinnedDeviceUID = UserDefaults.standard.string(forKey: "inputDeviceUID")
         pttKey = PTTKey.forKeycode(Int64(UserDefaults.standard.integer(forKey: "pttKeycode")))
         micIdleMinutes = UserDefaults.standard.integer(forKey: "micIdleMinutes")
@@ -214,6 +230,14 @@ final class DictationPipeline: NSObject {
                     warmupMs, mic.inputDescription))
 
                 self.transcriber = transcriber
+                // Vocabulary biasing initializes in the background: the CTC
+                // model download (dictionary non-empty only) must not delay
+                // readiness, and a failure inside just means plain
+                // transcription (logged in setVocabulary).
+                let dictionarySnapshot = self.dictionaryEntries
+                if !dictionarySnapshot.filter(\.enabled).isEmpty {
+                    Task { await transcriber.setVocabulary(dictionarySnapshot) }
+                }
                 let cleaner = await TranscriptCleaner.fromDefaults()
                 self.cleaner = cleaner
                 self.cleanupDescription = cleaner.map { "Cleanup: \($0.menuDescription)" } ?? "Cleanup: off"
@@ -450,6 +474,38 @@ final class DictationPipeline: NSObject {
         }
     }
 
+    /// Reads the dictionary from the store and rebuilds the deterministic
+    /// ReplacementEngine. Fail-open: a store problem means an empty
+    /// dictionary, never a broken pipeline.
+    private func loadDictionary() {
+        guard let store else { return }
+        do {
+            dictionaryEntries = try store.listDictionary()
+            replacementEngine = ReplacementEngine(entries: dictionaryEntries)
+            let enabled = dictionaryEntries.filter(\.enabled).count
+            if enabled > 0 {
+                harkLog("dictionary: \(enabled) enabled term(s) loaded.")
+            }
+        } catch {
+            harkLog("WARNING: could not read the dictionary: \(error)")
+            dictionaryEntries = []
+            replacementEngine = ReplacementEngine(entries: [])
+        }
+    }
+
+    /// Re-reads the dictionary and re-informs every layer: the replacement
+    /// engine (immediately), the transcriber's vocabulary-boosting session
+    /// (async — may download CTC models on first use), and the cleanup
+    /// prompt (picked up on the next dictation via dictionaryEntries).
+    /// The Dictionary settings tab calls this after every mutation.
+    func reloadDictionary() {
+        loadDictionary()
+        if let transcriber {
+            let snapshot = dictionaryEntries
+            Task { await transcriber.setVocabulary(snapshot) }
+        }
+    }
+
     /// (Re)starts the one-shot idle timer. Called after every dictation and
     /// whenever the setting changes; a 0/parked/cold mic means no timer.
     private func scheduleIdleTimer() {
@@ -658,23 +714,37 @@ final class DictationPipeline: NSObject {
                     format: "transcribed in %.0f ms (%.1fx real-time).",
                     result.transcribeSeconds * 1000, result.rtfx))
 
-                let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                var rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if rawText.isEmpty {
                     harkLog("empty transcript — nothing to paste.")
                 } else {
                     harkLog("transcript: \"\(rawText)\"")
+                    // Deterministic dictionary replacements on the raw
+                    // transcript BEFORE cleanup (the LLM sees corrected
+                    // input) …
+                    let pre = replacementEngine.applyReporting(rawText)
+                    for hit in pre.fired {
+                        harkLog("dictionary: \(hit.alias) -> \(hit.term)")
+                    }
+                    rawText = pre.text
                     var text = rawText
                     var cleanedForStore: String?
                     if let cleaner {
                         indicator.transition(to: .cleaning)
-                        let outcome = await cleaner.clean(rawText)
+                        let outcome = await cleaner.clean(rawText, dictionary: dictionaryEntries)
                         if outcome.cleaned {
+                            // … and on the cleanup output AFTER, so the LLM
+                            // can never regress a dictionary rule.
+                            let post = replacementEngine.applyReporting(outcome.text)
+                            for hit in post.fired {
+                                harkLog("dictionary: \(hit.alias) -> \(hit.term)")
+                            }
                             harkLog(String(
                                 format: "cleaned in %.0f ms: \"%@\"",
-                                outcome.elapsed.millisecondsValue, outcome.text))
-                            text = outcome.text
+                                outcome.elapsed.millisecondsValue, post.text))
+                            text = post.text
                             // Persist the cleaned text only when it differs.
-                            if outcome.text != rawText { cleanedForStore = outcome.text }
+                            if post.text != rawText { cleanedForStore = post.text }
                         } else {
                             harkLog(String(
                                 format: "cleanup failed open (%@ after %.0f ms) — pasting raw transcript.",
