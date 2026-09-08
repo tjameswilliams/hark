@@ -185,6 +185,106 @@ import Mark from "../components/Mark.astro";
     </p>
   </section>
 
+  <section class="prose compare-section">
+    <h2>What the subscriptions charge for</h2>
+    <p>
+      The paid dictation and meeting tools are good. Most of them are also a
+      monthly fee for sending your voice to someone else's computer. On the
+      things that matter, Hark matches them or wins; where it doesn't yet, the
+      table says so.
+    </p>
+    <div class="compare-wrap">
+      <table class="compare">
+        <thead>
+          <tr>
+            <th scope="col"></th>
+            <th scope="col" class="us">Hark</th>
+            <th scope="col">Wispr Flow</th>
+            <th scope="col">superwhisper</th>
+            <th scope="col">Granola</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">Price</th>
+            <td class="us"><strong>Free.</strong> Open source.</td>
+            <td>$15 per user per month ($12 billed yearly). Free tier capped at 2,000 words a week on desktop.</td>
+            <td>$849 lifetime is the headline price, or a monthly plan. Free tier keeps the small local models after 3,000 words.</td>
+            <td>Free until you want notes older than 30 days, then $14 per user per month.</td>
+          </tr>
+          <tr>
+            <th scope="row">Where your speech is transcribed</th>
+            <td class="us"><strong>On your Mac, always.</strong> Neural Engine.</td>
+            <td>In the cloud, always. Their privacy page says so in those words.</td>
+            <td>On your Mac on Apple Silicon. Cloud models optional.</td>
+            <td>Their servers (AWS, in the US).</td>
+          </tr>
+          <tr>
+            <th scope="row">Where your transcripts live</th>
+            <td class="us"><strong>One SQLite file</strong> in your Library folder.</td>
+            <td>Wispr's cloud. Dictation storage is a setting; meeting transcripts are stored there for syncing.</td>
+            <td>On your device.</td>
+            <td>Their servers.</td>
+          </tr>
+          <tr>
+            <th scope="row">Account required</th>
+            <td class="us"><strong>No.</strong></td>
+            <td>Yes.</td>
+            <td>Yes, for a licence.</td>
+            <td>Yes.</td>
+          </tr>
+          <tr>
+            <th scope="row">Meetings recorded without a bot joining</th>
+            <td class="us"><strong>Yes.</strong> Core Audio tap on the Mac.</td>
+            <td>Yes, on Mac.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+          </tr>
+          <tr>
+            <th scope="row">Your AI coding agents can read your notes</th>
+            <td class="us"><strong>Yes.</strong> Local MCP server, read-only.</td>
+            <td>None listed.</td>
+            <td>None listed.</td>
+            <td>On the Business plan, through their cloud.</td>
+          </tr>
+          <tr>
+            <th scope="row">Source you can read</th>
+            <td class="us"><strong>Yes.</strong> MIT or Apache-2.0.</td>
+            <td>No.</td>
+            <td>No.</td>
+            <td>No.</td>
+          </tr>
+          <tr class="honest">
+            <th scope="row">iPhone app</th>
+            <td class="us">Not yet.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+          </tr>
+          <tr class="honest">
+            <th scope="row">Windows</th>
+            <td class="us">No. Hark is built on Apple's Neural Engine and stays a Mac app.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      Read from each vendor's own pricing and privacy pages on 8 September
+      2026: <a href="https://wisprflow.ai/pricing">Wispr Flow</a>
+      (<a href="https://wisprflow.ai/privacy">privacy</a>),
+      <a href="https://superwhisper.com/">superwhisper</a>, and
+      <a href="https://www.granola.ai/pricing">Granola</a>
+      (<a href="https://docs.granola.ai/help-center/policies/privacy-policy">privacy</a>).
+      They change their plans; if a cell is out of date,
+      <a href="https://github.com/tjameswilliams/hark/issues">tell us</a> and it
+      gets fixed. Hark's speech model is NVIDIA Parakeet, the same family
+      superwhisper offers in its paid tier.
+    </p>
+  </section>
+
   <section class="prose">
     <h2>What stays on your Mac</h2>
     <p>Everything, with one exception you control.</p>

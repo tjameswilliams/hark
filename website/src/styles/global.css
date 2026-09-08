@@ -382,6 +382,67 @@ pre code {
   font-weight: 600;
 }
 
+/* The comparison. Wide by nature, so it scrolls inside its own container;
+   the page never scrolls sideways. Hark's column is tinted, the honest rows
+   at the bottom are not styled any differently: that is the point. */
+.compare-section {
+  margin-top: 4rem;
+}
+.compare-section h2 {
+  margin-top: 0;
+}
+.compare-wrap {
+  overflow-x: auto;
+  margin-top: 1.5rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-block);
+  background: var(--surface);
+}
+.compare {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 56rem;
+  font-size: 0.9375rem;
+  line-height: 1.4;
+}
+.compare th,
+.compare td {
+  padding: 0.85rem 1rem;
+  text-align: left;
+  vertical-align: top;
+  border-top: 1px solid var(--hairline);
+}
+.compare thead th {
+  border-top: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+.compare tbody th {
+  font-weight: 600;
+  color: var(--ink);
+  width: 11rem;
+}
+.compare td {
+  color: var(--ink-muted);
+}
+.compare .us {
+  background: var(--canvas);
+  color: var(--ink);
+}
+.compare thead .us {
+  color: var(--rufous);
+}
+.compare td.us strong {
+  color: var(--ink);
+}
+.compare-section .note {
+  margin-top: 1rem;
+  max-width: var(--measure);
+}
+
 /* The install path: number, body, and a keycap or mark on the right. */
 .steps {
   list-style: none;

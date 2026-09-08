@@ -238,7 +238,13 @@ Structure of the overview, top to bottom:
    permissions, hold the key.
 4. **For your AI tools.** The MCP server, with the one-line install per
    client.
-5. **What stays on your Mac.** The privacy claim, with the one exception
+5. **What the subscriptions charge for.** The comparison table: Wispr
+   Flow, superwhisper, Granola, on the axes Hark owns (where speech is
+   transcribed, where transcripts live, account, bot-free meetings, MCP,
+   source). Two honest "not yet" rows at the bottom (iPhone, Windows).
+   Every cell is read from the vendor's own pricing or privacy page and the
+   note carries the date and the links. Never claim parity on polish.
+6. **What stays on your Mac.** The privacy claim, with the one exception
    stated.
 
 Every page carries the license line in the footer: "Open source, MIT or
