@@ -24,7 +24,9 @@ const {
 } = Astro.props;
 const ogTitle = Astro.props.ogTitle ?? title.split(" | ")[0];
 const ogDescription = Astro.props.ogDescription ?? description.split(/(?<=\.)\s/)[0];
-const path = Astro.url.pathname;
+// With build.format "file" the pathname arrives as "/download.html"; the
+// CloudFront function serves clean URLs, so the canonical is the clean one.
+const path = Astro.url.pathname.replace(/\.html$/, "");
 const canonical = new URL(path === "/index" ? "/" : path, Astro.site).href;
 const imageUrl = new URL(image, Astro.site).href;
 // Square variant for the networks that crop to a thumbnail (Reddit, some
