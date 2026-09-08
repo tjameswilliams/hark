@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusController: StatusItemController?
     private var mainWindowController: MainWindowController?
     private var settingsWindowController: SettingsWindowController?
+    private var meetingReviewController: MeetingReviewWindowController?
     private var knowledge: RealKnowledgeService?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -30,6 +31,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.statusController = StatusItemController(
             pipeline: pipeline, meeting: meeting, mainWindow: mainWindow,
             settingsWindow: settingsWindow)
+        // Every stopped recording opens the review window: processing first,
+        // then name it and file it under a project.
+        let review = MeetingReviewWindowController(filer: meeting)
+        self.meetingReviewController = review
+        meeting.onMeetingFinished = { [weak review] session in review?.show(session) }
         // Embed anything new shortly after each store, so search stays fresh.
         pipeline.onDictationStored = { [weak knowledge] in knowledge?.indexSoon() }
         meeting.onMeetingStored = { [weak knowledge] in knowledge?.indexSoon() }

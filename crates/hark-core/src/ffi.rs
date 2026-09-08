@@ -831,6 +831,25 @@ impl HarkStore {
         Ok(())
     }
 
+    /// Renames a session. `None` clears the title so the UI falls back to its
+    /// default "Meeting" / "Dictation" label. Used by the post-meeting filing
+    /// window.
+    pub fn rename_session(&self, session_id: i64, title: Option<String>) -> Result<(), HarkError> {
+        let db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        let title = title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let changed = db.conn().execute(
+            "UPDATE sessions SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title, session_id],
+        )?;
+        if changed == 0 {
+            return Err(HarkError::Failure(format!("session #{session_id} not found")));
+        }
+        Ok(())
+    }
+
     // -- Session browsing ----------------------------------------------------
 
     /// Pageable session list, newest first, optionally filtered by kind

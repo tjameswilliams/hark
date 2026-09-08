@@ -1,5 +1,6 @@
 @preconcurrency import AudioToolbox
 import AVFoundation
+import os
 @preconcurrency import CoreAudio
 import Foundation
 
@@ -65,6 +66,13 @@ final class MeetingCapture {
     /// first, so the tuple is exactly what stop() returns and the partial
     /// file is ready for the normal processing path.
     var onCaptureLost: ((URL, Date, Date, Float, Float) -> Void)?
+
+    /// When the recording started, while one is running.
+    var recordingStartedAt: Date? { isRecording ? startedAt : nil }
+    /// The last moment either channel carried sound above room noise (see
+    /// MeetingCaptureIO's thresholds); nil until the first such buffer. The
+    /// controller's silence monitor compares this against the clock.
+    var lastActivityAt: Date? { io?.lastActivityAt }
 
     /// System-object listener for kAudioHardwarePropertyServiceRestarted;
     /// registered for the duration of a recording only.
@@ -473,17 +481,20 @@ private final class ChannelPipe: @unchecked Sendable {
 
     /// Downmixes `frames` frames of interleaved Float32 (`channels` wide) to
     /// mono, tracks the peak, converts to 16 kHz, and appends to the FIFO.
-    func feed(_ data: UnsafePointer<Float32>, frames: Int, channels: Int) {
+    /// Returns this buffer's own peak (the silence monitor's raw signal).
+    @discardableResult
+    func feed(_ data: UnsafePointer<Float32>, frames: Int, channels: Int) -> Float {
         guard frames > 0, channels > 0,
               let mono = AVAudioPCMBuffer(
                 pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(frames)),
               let dst = mono.floatChannelData?[0]
-        else { return }
+        else { return 0 }
 
+        var bufferPeak: Float = 0
         if channels == 1 {
             for i in 0..<frames {
                 dst[i] = data[i]
-                peak = max(peak, abs(data[i]))
+                bufferPeak = max(bufferPeak, abs(data[i]))
             }
         } else {
             let scale = 1 / Float(channels)
@@ -492,9 +503,10 @@ private final class ChannelPipe: @unchecked Sendable {
                 for ch in 0..<channels { sum += data[frame * channels + ch] }
                 let v = sum * scale
                 dst[frame] = v
-                peak = max(peak, abs(v))
+                bufferPeak = max(bufferPeak, abs(v))
             }
         }
+        peak = max(peak, bufferPeak)
         mono.frameLength = AVAudioFrameCount(frames)
 
         // Streaming conversion: feed exactly this buffer, then report
@@ -502,7 +514,7 @@ private final class ChannelPipe: @unchecked Sendable {
         let ratio = outputFormat.sampleRate / inputFormat.sampleRate
         let capacity = AVAudioFrameCount((Double(frames) * ratio).rounded(.up)) + 64
         guard let out = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            return
+            return bufferPeak
         }
         pending = mono
         var convError: NSError?
@@ -516,9 +528,10 @@ private final class ChannelPipe: @unchecked Sendable {
             return next
         }
         guard status != .error, out.frameLength > 0, let channel = out.floatChannelData else {
-            return
+            return bufferPeak
         }
         fifo.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: Int(out.frameLength)))
+        return bufferPeak
     }
 
     /// Pads the FIFO with silence up to `count` samples (used for the mic
@@ -542,6 +555,23 @@ private final class MeetingCaptureIO: @unchecked Sendable {
     private var loggedLayout = false
     private var callbackCount = 0
     private var framesWritten = 0
+
+    /// Peak thresholds (linear, 0…1) above which a buffer counts as
+    /// "someone is talking / the call is producing sound". Speech peaks sit
+    /// well above 0.1 at normal gain; keyboard clatter and room tone on the
+    /// mic hover around 0.01 to 0.03, hence the higher mic bar. System audio
+    /// is a clean mixdown, so a lower bar catches a quiet remote speaker.
+    static let micActivityThreshold: Float = 0.05
+    static let systemActivityThreshold: Float = 0.02
+    /// Seconds since the reference date of the last active buffer; 0 = none
+    /// yet. Written on the IO queue, read from the main actor by the silence
+    /// monitor, so it lives behind a lock.
+    private let lastActivity = OSAllocatedUnfairLock<Double>(initialState: 0)
+
+    var lastActivityAt: Date? {
+        let t = lastActivity.withLock { $0 }
+        return t > 0 ? Date(timeIntervalSinceReferenceDate: t) : nil
+    }
 
     init(fileURL: URL, inputSampleRate: Double) throws {
         micPipe = try ChannelPipe(inputSampleRate: inputSampleRate)
@@ -575,18 +605,24 @@ private final class MeetingCaptureIO: @unchecked Sendable {
         let sysBuffer = abl[bufferCount - 1]
         let bytesPerFloat = MemoryLayout<Float32>.size
 
+        var micPeak: Float = 0
+        var sysPeak: Float = 0
         if let micBuffer,
            micBuffer.mNumberChannels > 0,
            let data = micBuffer.mData?.assumingMemoryBound(to: Float32.self) {
             let channels = Int(micBuffer.mNumberChannels)
             let frames = Int(micBuffer.mDataByteSize) / (bytesPerFloat * channels)
-            micPipe.feed(data, frames: frames, channels: channels)
+            micPeak = micPipe.feed(data, frames: frames, channels: channels)
         }
         if sysBuffer.mNumberChannels > 0,
            let data = sysBuffer.mData?.assumingMemoryBound(to: Float32.self) {
             let channels = Int(sysBuffer.mNumberChannels)
             let frames = Int(sysBuffer.mDataByteSize) / (bytesPerFloat * channels)
-            sysPipe.feed(data, frames: frames, channels: channels)
+            sysPeak = sysPipe.feed(data, frames: frames, channels: channels)
+        }
+        if micPeak > Self.micActivityThreshold || sysPeak > Self.systemActivityThreshold {
+            let now = Date().timeIntervalSinceReferenceDate
+            lastActivity.withLock { $0 = now }
         }
         if micBuffer == nil {
             // Single-buffer degenerate case: keep the channels paired by

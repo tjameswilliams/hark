@@ -10,6 +10,16 @@ struct GeneralSettingsView: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
 
+    @State private var silenceEnabled: Bool = {
+        let d = UserDefaults.standard
+        return d.object(forKey: MeetingController.silenceMinutesKey) == nil
+            || d.integer(forKey: MeetingController.silenceMinutesKey) > 0
+    }()
+    @State private var silenceMinutes: Int = {
+        let stored = UserDefaults.standard.integer(forKey: MeetingController.silenceMinutesKey)
+        return stored > 0 ? stored : MeetingController.defaultSilenceMinutes
+    }()
+
     @State private var idleEnabled: Bool =
         UserDefaults.standard.integer(forKey: "micIdleMinutes") > 0
     @State private var idleMinutes: Int = {
@@ -31,6 +41,26 @@ struct GeneralSettingsView: View {
                 }
             } footer: {
                 Text("Hark lives in the menu bar, so starting it at login keeps dictation one keypress away.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Stop meeting recordings after silence", isOn: $silenceEnabled)
+                    .onChange(of: silenceEnabled) { _, newValue in
+                        UserDefaults.standard.set(newValue ? silenceMinutes : 0,
+                                                  forKey: MeetingController.silenceMinutesKey)
+                    }
+                if silenceEnabled {
+                    Stepper(value: $silenceMinutes, in: 1...60) {
+                        Text("After \(silenceMinutes) minute\(silenceMinutes == 1 ? "" : "s") without anyone speaking")
+                    }
+                    .onChange(of: silenceMinutes) { _, newValue in
+                        UserDefaults.standard.set(newValue, forKey: MeetingController.silenceMinutesKey)
+                    }
+                }
+            } footer: {
+                Text("When a call ends, its recording usually keeps running. Hark watches both the microphone and the system audio; once both have been quiet this long it stops the recording and opens the meeting so you can name it and file it. A recording with no sound at all stops after ten minutes.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
