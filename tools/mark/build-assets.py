@@ -10,7 +10,7 @@ Outputs:
     apps/Hark/Support/MenuBarIcon.png     18pt template icon for the status item (+@2x)
     website/public/favicon.svg            same, 64px viewBox
     website/public/apple-touch-icon.png   180px, square (iOS applies the mask)
-    website/public/og/card.png            1200x630 share card
+    website/public/og/*.png               share cards: landscape, square, per page
     website/public/brand/lockup.svg       lockup, currentColor, for the site
     website/public/brand/mark.svg         mark, currentColor, for the site
     docs/assets/banner.svg                README banner, dark ground
@@ -117,25 +117,54 @@ def main():
             "-o", str(SITE / "apple-touch-icon.png"))
         print("wrote website/public/apple-touch-icon.png")
 
-        # --- OG card 1200x630: lockup top-left inside an 84px safe area,
-        # tagline under it. Light canvas so it reads on both X and LinkedIn.
-        W, H, M = 1200, 630, 84
-        lock_w = 560
-        lock_h = lock_w * lh / lw
-        body = (f'<rect width="{W}" height="{H}" fill="{CANVAS_LIGHT}"/>'
-                + place(lockup, lw, lh, M + lock_w / 2, M + lock_h / 2, lock_w, lock_h, INK_LIGHT)
-                + f'<text x="{M}" y="{M + lock_h + 96}" font-family="{FONT}" font-size="54" '
-                  f'font-weight="600" fill="{INK_LIGHT}" letter-spacing="-1">'
-                  f'Hold a key. Speak. Release.</text>'
-                + f'<text x="{M}" y="{M + lock_h + 150}" font-family="{FONT}" font-size="30" '
-                  f'fill="{INK_MUTED_LIGHT}">Local dictation and meeting notes for your Mac. '
-                  f'Nothing leaves it.</text>'
-                + f'<rect x="{M}" y="{M + lock_h + 34}" width="96" height="6" fill="{RUFOUS}"/>')
-        (td / "og.svg").write_text(svg(W, H, body))
-        (SITE / "og").mkdir(exist_ok=True)
-        run("rsvg-convert", "-w", str(W), "-h", str(H), str(td / "og.svg"),
-            "-o", str(SITE / "og/card.png"))
-        print("wrote website/public/og/card.png")
+        # --- Share cards. Feeds are white, so the cards sit on the dark
+        # canvas: ivory lockup, ivory tagline, muted subline, rufous rule, and
+        # the domain in the corner. 1200x630 is the size every network crops
+        # least (LinkedIn wants at least 1200x627, X and Facebook 1.91:1); the
+        # 1200x1200 square serves the places that crop to a thumbnail. Text
+        # stays inside a 90px safe area so center crops never clip it.
+        def card(path, w, h, title, subline, footer="harkdictate.com  ·  free and open source  ·  runs on your Mac"):
+            M = 90
+            centered = h > w * 0.75
+            lock_w = 600 if centered else 440
+            lock_h = lock_w * lh / lw
+            if centered:
+                lx, ly = w / 2, h * 0.36
+                anchor, tx = "middle", w / 2
+                ty = ly + lock_h / 2 + 130
+            else:
+                lx, ly = M + lock_w / 2, M + lock_h / 2
+                anchor, tx = "start", M
+                ty = M + lock_h + 96
+            title_size = 60 if len(title) <= 30 else 50
+            body = (f'<rect width="{w}" height="{h}" fill="{CANVAS_DARK}"/>'
+                    + place(lockup, lw, lh, lx, ly, lock_w, lock_h, INK_DARK)
+                    + f'<text x="{tx}" y="{ty}" text-anchor="{anchor}" font-family="{FONT}" '
+                      f'font-size="{title_size}" font-weight="600" fill="{INK_DARK}" '
+                      f'letter-spacing="-1.2">{title}</text>'
+                    + f'<text x="{tx}" y="{ty + 58}" text-anchor="{anchor}" font-family="{FONT}" '
+                      f'font-size="30" fill="{INK_MUTED_DARK}">{subline}</text>'
+                    + f'<rect x="{tx - (48 if anchor == "middle" else 0)}" y="{ty + 92}" width="96" height="6" fill="{RUFOUS}"/>'
+                    + f'<text x="{w - M}" y="{h - 48}" text-anchor="end" font-family="{FONT}" '
+                      f'font-size="22" fill="{INK_MUTED_DARK}" opacity="0.8">{footer}</text>')
+            (td / "card.svg").write_text(svg(w, h, body))
+            run("rsvg-convert", "-w", str(w), "-h", str(h), str(td / "card.svg"), "-o", str(path))
+            print("wrote", path.relative_to(ROOT))
+
+        og = SITE / "og"
+        og.mkdir(exist_ok=True)
+        card(og / "card.png", 1200, 630,
+             "Hold a key. Speak. Release.",
+             "Local dictation and meeting notes for your Mac. Nothing leaves it.")
+        card(og / "card-square.png", 1200, 1200,
+             "Hold a key. Speak. Release.",
+             "Local dictation and meeting notes for your Mac.")
+        card(og / "download.png", 1200, 630,
+             "Download Hark for Mac",
+             "Free. Signed and notarized. macOS 15 or later on Apple Silicon.")
+        card(og / "privacy.png", 1200, 630,
+             "Hark collects nothing.",
+             "Audio and transcripts stay on your Mac. There is no server.")
 
     # --- Menu bar template icon: the mark in black on transparent, 18pt
     # (macOS status items are 18pt tall; @2x for Retina). NSImage.isTemplate
