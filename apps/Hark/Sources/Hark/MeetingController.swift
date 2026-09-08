@@ -13,7 +13,7 @@ enum MeetingState: Equatable {
 ///
 /// Every stop, whatever its cause, produces a MeetingReviewSession that the
 /// review window shows: processing progress first, then the name-and-file
-/// form. A silence monitor ends recordings the user forgot about.
+/// form. A silence monitor asks about recordings the user forgot about.
 @MainActor
 final class MeetingController: MeetingFiler {
     private let capture = MeetingCapture()
@@ -33,6 +33,10 @@ final class MeetingController: MeetingFiler {
     /// window should show. Processing continues in the background and
     /// updates the session's phase.
     var onMeetingFinished: ((MeetingReviewSession) -> Void)?
+    /// Fires when the silence monitor wants to ask whether to stop. The
+    /// prompt object is updated live (quiet time, dismissal when sound
+    /// resumes) and answered through keepRecording() / stopRecording().
+    var onSilencePrompt: ((SilencePrompt) -> Void)?
 
     private(set) var state: MeetingState = .idle {
         didSet { if state != oldValue { onStateChange?(state) } }
@@ -54,16 +58,22 @@ final class MeetingController: MeetingFiler {
 
     // MARK: - Silence monitor
 
-    /// UserDefaults key: minutes of silence after which a recording stops on
-    /// its own. 0 disables. Missing means the default below.
+    /// UserDefaults key: minutes of silence after which Hark asks whether to
+    /// stop the recording. 0 disables. Missing means the default below.
     static let silenceMinutesKey = "meetingSilenceMinutes"
     static let defaultSilenceMinutes = 2
     /// A recording that never carried any sound (the call never connected,
-    /// wrong input device) is stopped after this long regardless, so a
-    /// forgotten empty recording cannot run for hours.
+    /// wrong input device) is asked about after this long regardless, so a
+    /// forgotten empty recording does not run for hours unquestioned.
     private static let neverActiveStopSeconds: TimeInterval = 10 * 60
     private static let silenceCheckInterval: TimeInterval = 5
     private var silenceTimer: Timer?
+    /// The open question, while one is showing.
+    private var silencePrompt: SilencePrompt?
+    /// Set when the user answers Keep Recording: no new question until sound
+    /// has come back and gone quiet again, so a long silent stretch the user
+    /// has already vouched for does not nag every two minutes.
+    private var silenceAcknowledgedAt: Date?
 
     /// Effective silence window in seconds; 0 when the feature is off.
     var silenceStopSeconds: TimeInterval {
@@ -85,6 +95,7 @@ final class MeetingController: MeetingFiler {
                     guard let self else { return }
                     self.state = .idle
                     self.stopSilenceMonitor()
+                    self.dismissSilencePrompt()
                     harkLog(String(
                         format: "meeting: capture lost — peaks mic %.4f, system %.4f. processing partial %@ …",
                         micPeak, systemPeak, url.lastPathComponent))
@@ -105,6 +116,7 @@ final class MeetingController: MeetingFiler {
         do {
             try capture.start(micDeviceUID: pinnedUID)
             state = .recording(startedAt: Date())
+            silenceAcknowledgedAt = nil
             startSilenceMonitor()
         } catch {
             harkLog("meeting: could not start recording: \(error)")
@@ -117,6 +129,7 @@ final class MeetingController: MeetingFiler {
     func stopRecording(reason: MeetingStopReason = .user) {
         guard isRecording, capture.isRecording else { return }
         stopSilenceMonitor()
+        dismissSilencePrompt()
         let result = capture.stop()
         state = .idle
 
@@ -129,12 +142,14 @@ final class MeetingController: MeetingFiler {
 
     private func startSilenceMonitor() {
         stopSilenceMonitor()
-        // Target/selector, not the block API — the @Sendable block would
-        // need to capture this non-Sendable MainActor object. .common mode so
-        // it keeps ticking while the status menu is open.
-        let timer = Timer(
-            timeInterval: Self.silenceCheckInterval, target: self,
-            selector: #selector(silenceTick), userInfo: nil, repeats: true)
+        lastQuietReport = nil
+        // Block timer: this class is not an NSObject, so the target/selector
+        // form cannot dispatch to it. The block fires on the main run loop,
+        // hence the assumeIsolated hop back onto the main actor. .common mode
+        // so it keeps ticking while the status menu is open.
+        let timer = Timer(timeInterval: Self.silenceCheckInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.silenceTick() }
+        }
         RunLoop.main.add(timer, forMode: .common)
         silenceTimer = timer
     }
@@ -144,21 +159,70 @@ final class MeetingController: MeetingFiler {
         silenceTimer = nil
     }
 
-    @objc private func silenceTick() {
+    /// Last time the quiet duration was logged; once a minute is enough to
+    /// diagnose a threshold without flooding the log.
+    private var lastQuietReport: Date?
+
+    private func silenceTick() {
         guard isRecording, let startedAt = capture.recordingStartedAt else { return }
         let window = silenceStopSeconds
         guard window > 0 else { return }
         let now = Date()
-        if let last = capture.lastActivityAt {
-            let quiet = now.timeIntervalSince(last)
-            if quiet >= window {
-                harkLog(String(format: "meeting: %.0f s of silence — stopping automatically.", quiet))
-                stopRecording(reason: .silence(seconds: Int(window)))
-            }
-        } else if now.timeIntervalSince(startedAt) >= max(window, Self.neverActiveStopSeconds) {
-            harkLog("meeting: no sound at all since the recording started — stopping automatically.")
-            stopRecording(reason: .silence(seconds: Int(now.timeIntervalSince(startedAt))))
+        let last = capture.lastActivityAt
+        let quietSince = last ?? startedAt
+        let quiet = now.timeIntervalSince(quietSince)
+        if lastQuietReport.map({ now.timeIntervalSince($0) >= 60 }) ?? true {
+            lastQuietReport = now
+            harkLog(String(
+                format: "meeting: quiet for %.0f s (asks at %.0f s; %@)",
+                quiet, last == nil ? max(window, Self.neverActiveStopSeconds) : window,
+                last == nil ? "no sound heard yet" : "sound was heard"))
         }
+
+        // Sound came back: withdraw an open question, and forget a previous
+        // "keep recording" so the next silent stretch asks again.
+        if let last, let ack = silenceAcknowledgedAt, last > ack {
+            silenceAcknowledgedAt = nil
+        }
+        if let prompt = silencePrompt {
+            if quiet < window {
+                harkLog("meeting: sound resumed — withdrawing the stop question.")
+                dismissSilencePrompt()
+            } else {
+                prompt.quietSeconds = Int(quiet)
+            }
+            return
+        }
+        guard silenceAcknowledgedAt == nil else { return }
+
+        let threshold = last == nil ? max(window, Self.neverActiveStopSeconds) : window
+        if quiet >= threshold {
+            harkLog(String(format: "meeting: %.0f s of silence — asking whether to stop.", quiet))
+            let prompt = SilencePrompt(
+                quietSeconds: Int(quiet), heardAnything: last != nil, startedAt: startedAt)
+            silencePrompt = prompt
+            onSilencePrompt?(prompt)
+        }
+    }
+
+    /// The user's answer to the silence question: carry on. No new question
+    /// until sound has resumed and stopped again.
+    func keepRecording() {
+        silenceAcknowledgedAt = Date()
+        harkLog("meeting: user chose to keep recording through the silence.")
+        dismissSilencePrompt()
+    }
+
+    /// The user's answer to the silence question: stop. `quietSeconds` is
+    /// what the prompt showed, so the review window can say how long.
+    func stopAfterSilence() {
+        let quiet = silencePrompt?.quietSeconds ?? Int(silenceStopSeconds)
+        stopRecording(reason: .silence(seconds: quiet))
+    }
+
+    private func dismissSilencePrompt() {
+        silencePrompt?.isDismissed = true
+        silencePrompt = nil
     }
 
     /// Shared post-capture path (normal stop, silence stop, AND capture-lost

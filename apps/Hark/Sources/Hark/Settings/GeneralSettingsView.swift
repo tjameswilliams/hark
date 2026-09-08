@@ -46,7 +46,7 @@ struct GeneralSettingsView: View {
             }
 
             Section {
-                Toggle("Stop meeting recordings after silence", isOn: $silenceEnabled)
+                Toggle("Ask to stop meeting recordings after silence", isOn: $silenceEnabled)
                     .onChange(of: silenceEnabled) { _, newValue in
                         UserDefaults.standard.set(newValue ? silenceMinutes : 0,
                                                   forKey: MeetingController.silenceMinutesKey)
@@ -60,7 +60,7 @@ struct GeneralSettingsView: View {
                     }
                 }
             } footer: {
-                Text("When a call ends, its recording usually keeps running. Hark watches both the microphone and the system audio; once both have been quiet this long it stops the recording and opens the meeting so you can name it and file it. A recording with no sound at all stops after ten minutes.")
+                Text("When a call ends, its recording usually keeps running. Hark watches both the microphone and the system audio; once both have been quiet this long it asks whether to stop. Say yes and it makes the transcript and opens the meeting so you can name it and file it; say no and it will not ask again until sound has come and gone once more. The question withdraws itself if sound resumes. A recording with no sound at all is asked about after ten minutes.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

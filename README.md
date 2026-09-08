@@ -35,7 +35,7 @@ raw transcript pastes instead. It never fails closed.
 
 **Meetings.** Hark captures a meeting's audio straight from Core Audio,
 whichever app is running it, then separates the speakers and transcribes it on
-your Mac. When the call goes quiet for two minutes it stops on its own and
+your Mac. When the call goes quiet for two minutes it asks whether to stop, then
 opens the meeting so you can name it and file it under a project. No bot joins
 your call and the recording never goes to a cloud service.
 

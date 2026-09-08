@@ -22,10 +22,10 @@ enum MeetingStopReason: Equatable, Sendable {
         case .user: return "Stopped by you."
         case .silence(let seconds):
             let minutes = seconds / 60
-            if minutes >= 1, seconds % 60 == 0 {
-                return "Stopped after \(minutes) minute\(minutes == 1 ? "" : "s") of silence."
+            if minutes >= 1 {
+                return "Stopped by you after \(minutes) minute\(minutes == 1 ? "" : "s") of silence."
             }
-            return "Stopped after \(seconds) seconds of silence."
+            return "Stopped by you after \(seconds) seconds of silence."
         case .captureLost: return "The audio system restarted; everything captured so far was kept."
         case .quit: return "Hark quit during the recording; the file was closed safely."
         }
@@ -450,5 +450,147 @@ struct MeetingReviewView: View {
         } catch {
             session.fileError = "Couldn't file the meeting: \(error.localizedDescription)"
         }
+    }
+}
+
+
+// MARK: - The silence question
+
+/// "Still recording?" Raised by the MeetingController's silence monitor,
+/// answered by the two buttons, withdrawn on its own if sound resumes.
+@MainActor
+@Observable
+final class SilencePrompt {
+    var quietSeconds: Int
+    /// False when the recording has carried no sound at all since it began.
+    let heardAnything: Bool
+    let startedAt: Date
+    /// Set by the controller when the question no longer applies (sound
+    /// resumed, the user answered from elsewhere, or the recording stopped).
+    var isDismissed = false
+
+    init(quietSeconds: Int, heardAnything: Bool, startedAt: Date) {
+        self.quietSeconds = quietSeconds
+        self.heardAnything = heardAnything
+        self.startedAt = startedAt
+    }
+
+    var quietLabel: String {
+        let m = quietSeconds / 60
+        if m >= 1 { return "\(m) minute\(m == 1 ? "" : "s")" }
+        return "\(quietSeconds) seconds"
+    }
+}
+
+/// Small floating panel on the display under the pointer. Non-modal: the
+/// recording carries on until the user answers, and the panel closes itself
+/// when sound comes back.
+@MainActor
+final class SilencePromptWindowController: NSWindowController, NSWindowDelegate {
+    private weak var meeting: MeetingController?
+    private var observation: Task<Void, Never>?
+
+    init(meeting: MeetingController) {
+        self.meeting = meeting
+        let window = HarkMainWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 170),
+            styleMask: [.titled, .closable],
+            backing: .buffered, defer: false)
+        window.title = "Hark"
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        super.init(window: window)
+        window.delegate = self
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("SilencePromptWindowController is code-only") }
+
+    func show(_ prompt: SilencePrompt) {
+        guard let meeting, let window else { return }
+        let host = NSHostingView(rootView: SilencePromptView(
+            prompt: prompt,
+            keep: { [weak meeting] in meeting?.keepRecording() },
+            stop: { [weak meeting] in meeting?.stopAfterSilence() }))
+        host.sizingOptions = []
+        window.contentView = host
+        window.setContentSize(NSSize(width: 420, height: 170))
+        // Same placement rule as the review window: where the pointer is.
+        let mouse = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+            ?? NSScreen.main {
+            let v = screen.visibleFrame
+            window.setFrameOrigin(NSPoint(x: v.midX - 210, y: v.midY + v.height * 0.18))
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Close when the controller withdraws the question.
+        observation?.cancel()
+        observation = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                if prompt.isDismissed {
+                    self?.window?.orderOut(nil)
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    /// Closing the panel with its close button is a "keep recording".
+    func windowWillClose(_ notification: Notification) {
+        observation?.cancel()
+        observation = nil
+        if let meeting, meeting.isRecording {
+            meeting.keepRecording()
+        }
+        window?.contentView = nil
+    }
+}
+
+struct SilencePromptView: View {
+    @Bindable var prompt: SilencePrompt
+    let keep: () -> Void
+    let stop: () -> Void
+
+    private static let rufous = Color(red: 0xb8 / 255, green: 0x43 / 255, blue: 0x2a / 255)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(nsImage: NSImage(named: "MenuBarIcon") ?? NSImage())
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(Self.rufous)
+                    .frame(width: 28, height: 28)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Still recording?")
+                        .font(.headline)
+                    Text(prompt.heardAnything
+                         ? "Nothing has been heard for \(prompt.quietLabel). If the meeting is over, stop now and Hark will make the transcript."
+                         : "No sound has reached Hark since the recording started \(prompt.quietLabel) ago. Check the input device, or stop if this was a false start.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 0)
+            HStack {
+                Text("Recording continues until you answer.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button("Keep Recording") { keep() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Stop Recording") { stop() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Self.rufous)
+            }
+        }
+        .padding(18)
+        .frame(width: 420, height: 170)
     }
 }
