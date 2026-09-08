@@ -11,8 +11,8 @@
 # website links. deploy.sh uploads versioned dmgs without --delete, so every
 # pinned URL keeps resolving after later releases.
 cask "hark" do
-  version "0.1.0"
-  sha256 "f2aaf44d3d33f6e0216154f1c51e389cf6843d86dd52c92ee21a5b78dc06b195"
+  version "0.2.0"
+  sha256 "21cf3ce5bdb16001850140774c79f072db649031ae13c83fd899f3f01ddc620d"
 
   url "https://harkdictate.com/downloads/Hark-#{version}.dmg"
   name "Hark"
