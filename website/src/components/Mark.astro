@@ -1,0 +1,21 @@
+---
+// The head alone, for square slots. Same inlining as Lockup.astro.
+import { readFileSync } from "node:fs";
+interface Props {
+  size?: number;
+  label?: string;
+}
+const { size = 32, label } = Astro.props;
+const src = readFileSync(new URL("../../public/brand/mark.svg", import.meta.url), "utf8");
+const inner = src.slice(src.indexOf("<g "), src.lastIndexOf("</g>") + 4);
+---
+
+<svg
+  viewBox="0 0 471 480"
+  width={size}
+  height={size}
+  role={label ? "img" : undefined}
+  aria-label={label}
+  aria-hidden={label ? undefined : "true"}
+  set:html={inner}
+/>

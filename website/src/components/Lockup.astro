@@ -1,0 +1,16 @@
+---
+// The Call: hawk head + HARK, inlined from the brand source so it takes
+// currentColor and needs no extra request. Height in px; width follows the
+// source's 902x496 box.
+import { readFileSync } from "node:fs";
+interface Props {
+  height?: number;
+  label?: string;
+}
+const { height = 40, label = "Hark" } = Astro.props;
+const src = readFileSync(new URL("../../public/brand/lockup.svg", import.meta.url), "utf8");
+const inner = src.slice(src.indexOf("<g "), src.lastIndexOf("</g>") + 4);
+const width = Math.round((height * 902) / 496);
+---
+
+<svg viewBox="0 0 902 496" width={width} height={height} role="img" aria-label={label} set:html={inner} />

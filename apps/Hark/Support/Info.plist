@@ -6,6 +6,8 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>Hark</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.hark.app</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -24,6 +26,8 @@
 	<true/>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Hark records meeting audio (system sound + microphone) to transcribe it on-device.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright Tim Williams. MIT or Apache-2.0.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Hark converts your speech to text on-device.</string>
 	<key>NSPrincipalClass</key>

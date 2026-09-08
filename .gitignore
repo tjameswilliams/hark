@@ -21,3 +21,6 @@ xcuserdata/
 *.sqlite-shm
 .env
 .build-*/
+
+# Release artifacts (scripts/release.sh writes <repo>/dist/)
+/dist/
