@@ -7,6 +7,7 @@ Sources (edit these, never the outputs):
 
 Outputs:
     apps/Hark/Support/AppIcon.icns        macOS app icon (ivory mark on rufous)
+    apps/Hark/Support/MenuBarIcon.png     18pt template icon for the status item (+@2x)
     website/public/favicon.svg            same, 64px viewBox
     website/public/apple-touch-icon.png   180px, square (iOS applies the mask)
     website/public/og/card.png            1200x630 share card
@@ -135,6 +136,26 @@ def main():
         run("rsvg-convert", "-w", str(W), "-h", str(H), str(td / "og.svg"),
             "-o", str(SITE / "og/card.png"))
         print("wrote website/public/og/card.png")
+
+    # --- Menu bar template icon: the mark in black on transparent, 18pt
+    # (macOS status items are 18pt tall; @2x for Retina). NSImage.isTemplate
+    # then recolors it for the current menu bar appearance.
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        # The mark's single-weight line is drawn for 40px and up; at 18pt it
+        # thins to a whisper, so render large, thicken the stroke with a
+        # morphological dilate, then downsample.
+        for scale, name in ((1, "MenuBarIcon.png"), (2, "MenuBarIcon@2x.png")):
+            px = 18 * scale
+            big = px * 8
+            body = place(mark, mw, mh, big / 2, big / 2, big * 0.95, big * 0.95, "#000000")
+            (td / "menubar.svg").write_text(svg(big, big, body))
+            run("rsvg-convert", "-w", str(big), "-h", str(big), str(td / "menubar.svg"),
+                "-o", str(td / "menubar-big.png"))
+            run("magick", str(td / "menubar-big.png"), "-channel", "A",
+                "-morphology", "Dilate", f"Disk:{2.5 * scale}", "+channel",
+                "-resize", f"{px}x{px}", str(ROOT / "apps/Hark/Support" / name))
+        print("wrote apps/Hark/Support/MenuBarIcon.png (+@2x)")
 
     # --- README banner: dark ground so it sits on GitHub light and dark alike.
     W, H = 760, 300

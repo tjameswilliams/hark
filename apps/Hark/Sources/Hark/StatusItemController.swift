@@ -43,11 +43,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
-        // SF Symbol "bird", template so it adapts to menu bar appearance;
-        // "waveform" is the fallback on systems without the bird symbol.
-        let image = NSImage(systemSymbolName: "bird", accessibilityDescription: "Hark")
+        // The Hark mark (docs/brand.md §2.1) as a template image, so it takes
+        // the menu bar's appearance; build-app.sh copies MenuBarIcon.png and
+        // its @2x into Contents/Resources. SF Symbols are the fallback if the
+        // resource is missing (e.g. a bare `swift run`).
+        let image = NSImage(named: "MenuBarIcon")
+            ?? NSImage(systemSymbolName: "bird", accessibilityDescription: "Hark")
             ?? NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hark")
         image?.isTemplate = true
+        image?.accessibilityDescription = "Hark"
         statusItem.button?.image = image
         statusItem.button?.toolTip = pipeline.tooltip
 

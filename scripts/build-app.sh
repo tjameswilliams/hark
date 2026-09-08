@@ -61,6 +61,7 @@ cp apps/Hark/.build/release/Hark "$APP/Contents/MacOS/Hark"
 cp "$MCP_BIN" "$APP/Contents/MacOS/hark-mcp"
 cp apps/Hark/Support/Info.plist "$APP/Contents/Info.plist"
 cp apps/Hark/Support/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp apps/Hark/Support/MenuBarIcon.png apps/Hark/Support/MenuBarIcon@2x.png "$APP/Contents/Resources/"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Release builds (scripts/release.sh) stamp the version before signing;
