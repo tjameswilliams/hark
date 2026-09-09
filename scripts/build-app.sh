@@ -60,7 +60,18 @@ cp apps/Hark/.build/release/Hark "$APP/Contents/MacOS/Hark"
 # i.e. exactly Contents/MacOS/hark-mcp.
 cp "$MCP_BIN" "$APP/Contents/MacOS/hark-mcp"
 cp apps/Hark/Support/Info.plist "$APP/Contents/Info.plist"
+cp apps/Hark/Support/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp apps/Hark/Support/MenuBarIcon.png apps/Hark/Support/MenuBarIcon@2x.png "$APP/Contents/Resources/"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# Release builds (scripts/release.sh) stamp the version before signing;
+# the checked-in Info.plist keeps the development values.
+if [ -n "${HARK_VERSION:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $HARK_VERSION" "$APP/Contents/Info.plist"
+fi
+if [ -n "${HARK_BUILD:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $HARK_BUILD" "$APP/Contents/Info.plist"
+fi
 
 # Prefer a real signing identity: TCC keys grants to the signing identity, so
 # a Developer ID-signed app keeps Accessibility/Microphone across rebuilds
@@ -75,7 +86,10 @@ if [ -z "$IDENTITY" ]; then
 fi
 if [ -n "$IDENTITY" ]; then
     echo "==> [6/6] codesign ($IDENTITY)"
-    SIGN=(--sign "$IDENTITY")
+    # Hardened runtime + timestamp are what notarization requires; the
+    # entitlements file re-allows the microphone under the hardened runtime.
+    SIGN=(--sign "$IDENTITY" --options runtime --timestamp
+          --entitlements apps/Hark/Support/Hark.entitlements)
 else
     echo "==> [6/6] codesign (ad-hoc — no Developer ID identity found)"
     SIGN=(-s -)

@@ -1,0 +1,56 @@
+---
+import Base from "../layouts/Base.astro";
+---
+
+<Base
+  title="Download | Hark"
+  ogTitle="Download Hark for Mac"
+  description="Install Hark with Homebrew or a direct download. macOS 15 or later on Apple Silicon. Signed and notarized."
+  ogDescription="Free. Homebrew or a signed, notarized dmg. macOS 15 or later on Apple Silicon."
+  image="/og/download.png"
+  imageAlt="The Hark mark over the line: Download Hark for Mac. Free. Signed and notarized."
+>
+  <section class="hero">
+    <h1>Download</h1>
+    <p class="lede">One app. It lives in the menu bar.</p>
+  </section>
+
+  <section class="prose">
+    <h2>Homebrew</h2>
+    <p>The easiest route, and <code>brew upgrade</code> keeps it current.</p>
+    <pre><code>brew install --cask tjameswilliams/tap/hark</code></pre>
+    <p class="note">
+      This also puts <code>hark-mcp</code> on your PATH for the AI tool
+      integrations.
+    </p>
+
+    <h2>Direct download</h2>
+    <div class="actions" style="margin-top: 1rem;">
+      <a class="button" href="/downloads/Hark.dmg">Download .dmg</a>
+    </div>
+    <p class="note" style="margin-top: 1rem;">
+      Requires macOS 15 Sequoia or later on Apple Silicon. Signed with a
+      Developer ID and notarized by Apple.
+    </p>
+
+    <h2>First launch</h2>
+    <ul>
+      <li>Open Hark. It appears in the menu bar as the hawk, with no Dock icon.</li>
+      <li>Grant <strong>Microphone</strong> and <strong>Accessibility</strong> when asked. Hark opens the right pane in System Settings for each.</li>
+      <li>Hold right <kbd>⌘</kbd>, say something, let go.</li>
+    </ul>
+    <p>
+      The first dictation downloads the speech model, about 600 MB, to your
+      Library folder. After that Hark works offline.
+    </p>
+
+    <h2>Build it yourself</h2>
+    <p>
+      The source is MIT or Apache-2.0. With Rust and Xcode installed:
+    </p>
+    <pre><code>git clone https://github.com/tjameswilliams/hark
+cd hark
+scripts/build-app.sh
+open build/Hark.app</code></pre>
+  </section>
+</Base>

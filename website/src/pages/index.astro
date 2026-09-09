@@ -1,0 +1,304 @@
+---
+import Base from "../layouts/Base.astro";
+import Lockup from "../components/Lockup.astro";
+import Mark from "../components/Mark.astro";
+---
+
+<Base
+  title="Hark: local dictation and meeting notes for your Mac"
+  ogTitle="Hold a key. Speak. Release."
+  description="Hark is push-to-talk dictation and meeting transcription that runs entirely on your Mac. Speech recognition on the Neural Engine, one SQLite file, an MCP server for your AI tools. Nothing leaves the machine."
+  ogDescription="Free, open-source dictation and meeting notes that run entirely on your Mac. Nothing leaves it."
+>
+  <section class="hero">
+    <div class="lockup"><Lockup height={160} label="Hark" /></div>
+    <h1>Hold a key. Speak. Release.<br />Clean text lands wherever your cursor is.</h1>
+    <p class="lede">
+      Hark is dictation and meeting transcription that runs entirely on your
+      Mac. Speech recognition on the Neural Engine, speaker separation and
+      search in one local database, and nothing sent anywhere. Not to us,
+      because there is no us to send it to.
+    </p>
+    <div class="install">
+      <pre><code>brew install --cask tjameswilliams/tap/hark</code></pre>
+      <p class="note">
+        Free and open source. macOS 15 or later on Apple Silicon.
+        Or <a href="/download">download the .dmg</a>.
+      </p>
+    </div>
+    <div class="actions">
+      <a class="button" href="/download">Download for Mac</a>
+      <a class="button secondary" href="https://github.com/tjameswilliams/hark">Read the source</a>
+    </div>
+    <p class="note" style="margin-top: 2rem;">
+      <span class="listening" aria-hidden="true"><span class="bars"><i></i><i></i><i></i><i></i><i></i></span>Listening</span>
+    </p>
+  </section>
+
+  <section class="demo-section">
+    <h2>See it work</h2>
+    <figure class="demo">
+      <video
+        src="/demos/dictate.mp4"
+        poster="/demos/dictate.jpg"
+        controls
+        muted
+        loop
+        playsinline
+        preload="none"
+      ></video>
+      <figcaption>
+        <strong>Fourteen seconds, start to finish.</strong>
+        Hold the key, say what you want, let go. The text lands in the agent's
+        prompt and it gets to work.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section class="grid" aria-label="What Hark does">
+    <div class="card">
+      <span class="eyebrow">Dictation</span>
+      <h3>Hold right ⌘ and talk</h3>
+      <p>
+        Release, and the transcript is pasted into whatever field is focused,
+        in any app. Filler words and punctuation are tidied by a cleanup model
+        you choose, and if that model is slow or down, the raw transcript
+        pastes instead. It never fails closed.
+      </p>
+    </div>
+    <div class="card">
+      <span class="eyebrow">Meetings</span>
+      <h3>Record any call, no bot in the room</h3>
+      <p>
+        Hark captures the meeting's audio straight from Core Audio, whichever
+        app is running it, then separates the speakers and transcribes it on
+        your Mac. When the call goes quiet, Hark asks whether to stop, then has you
+        name the meeting and file it under a project. Nobody joins your
+        call and nothing goes to a cloud service.
+      </p>
+    </div>
+    <div class="card">
+      <span class="eyebrow">Knowledge</span>
+      <h3>Everything you said, searchable</h3>
+      <p>
+        Dictations and meetings are embedded and grouped into projects. Search
+        them by keyword or by meaning, or ask a question and get an answer
+        with the transcript to back it up.
+      </p>
+    </div>
+    <div class="card">
+      <span class="eyebrow">Neural Engine</span>
+      <h3>Fast because it is local</h3>
+      <p>
+        NVIDIA's Parakeet model runs on the Apple Neural Engine through Core
+        ML. A ten-second utterance transcribes in about a tenth of a second,
+        on battery, with the fans off.
+      </p>
+    </div>
+    <div class="card">
+      <span class="eyebrow">Dictionary</span>
+      <h3>Teach it your names</h3>
+      <p>
+        Add the people, products and jargon it keeps misspelling. Terms feed
+        speech recognition, the cleanup model and a final spelling pass, so
+        they come out right every time.
+      </p>
+    </div>
+    <div class="card">
+      <span class="eyebrow">Your data</span>
+      <h3>One SQLite file</h3>
+      <p>
+        Every transcript lives in a single database in your Library folder.
+        Back it up, query it, delete it. There is no account and no sync,
+        because there is no server.
+      </p>
+    </div>
+  </section>
+
+  <section class="prose">
+    <h2>Zero to dictating</h2>
+    <p>From nothing installed to text on the screen, in three steps.</p>
+    <ol class="steps">
+      <li>
+        <span class="step-digit" aria-label="Step 1">1</span>
+        <div class="step-body">
+          <h3>Install Hark</h3>
+          <pre><code>brew install --cask tjameswilliams/tap/hark</code></pre>
+          <p class="note">Or <a href="/download">download the .dmg</a> and drag it to Applications. Signed and notarized by Apple.</p>
+        </div>
+        <span class="step-art"><Mark size={40} /></span>
+      </li>
+      <li>
+        <span class="step-digit" aria-label="Step 2">2</span>
+        <div class="step-body">
+          <h3>Grant two permissions</h3>
+          <p>
+            Microphone, to hear you, and Accessibility, to paste where your
+            cursor is. Hark asks for both on first launch and opens the right
+            System Settings pane for each. Meeting capture asks for audio
+            recording the first time you use it.
+          </p>
+        </div>
+        <span class="step-art"><kbd>⚙︎</kbd></span>
+      </li>
+      <li>
+        <span class="step-digit" aria-label="Step 3">3</span>
+        <div class="step-body">
+          <h3>Hold the key</h3>
+          <p>
+            Right ⌘ by default; right ⌥ or right ⌃ if you prefer. A rufous
+            pill appears while Hark is listening. Let go and the text arrives.
+            Taps shorter than a third of a second are ignored, so the key
+            still works in shortcuts.
+          </p>
+        </div>
+        <span class="step-art"><kbd>⌘</kbd></span>
+      </li>
+    </ol>
+  </section>
+
+  <section class="prose">
+    <h2>For your AI tools</h2>
+    <p>
+      Hark ships a small MCP server, <code>hark-mcp</code>, that lets Claude
+      Code, OpenCode and Codex search and read your meetings and dictations.
+      It opens the database read-only and runs only while the tool is asking.
+      Register it once per client from the Settings window, or from the
+      terminal:
+    </p>
+    <div class="clients">
+      <div class="card">
+        <h3>Claude Code</h3>
+        <pre><code>hark-mcp install --client claude</code></pre>
+      </div>
+      <div class="card">
+        <h3>OpenCode</h3>
+        <pre><code>hark-mcp install --client opencode</code></pre>
+      </div>
+      <div class="card">
+        <h3>Codex</h3>
+        <pre><code>hark-mcp install --client codex</code></pre>
+      </div>
+    </div>
+    <p class="note" style="margin-top: 1rem;">
+      Tools: <code>search_knowledge</code>, <code>list_projects</code>,
+      <code>list_sessions</code>, <code>get_transcript</code>,
+      <code>recent_meetings</code>. Read-only by construction.
+    </p>
+  </section>
+
+  <section class="prose compare-section">
+    <h2 id="what-the-subscriptions-charge-for">What the subscriptions charge for</h2>
+    <p>
+      The paid dictation and meeting tools are good. Most of them are also a
+      monthly fee for sending your voice to someone else's computer. On the
+      things that matter, Hark matches them or wins; where it doesn't yet, the
+      table says so.
+    </p>
+    <div class="compare-wrap">
+      <table class="compare">
+        <thead>
+          <tr>
+            <th scope="col"></th>
+            <th scope="col" class="us">Hark</th>
+            <th scope="col">Wispr Flow</th>
+            <th scope="col">superwhisper</th>
+            <th scope="col">Granola</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">Price</th>
+            <td class="us"><strong>Free.</strong> Open source.</td>
+            <td>$15 per user per month ($12 billed yearly). Free tier capped at 2,000 words a week on desktop.</td>
+            <td>$849 lifetime is the headline price, or a monthly plan. Free tier keeps the small local models after 3,000 words.</td>
+            <td>Free until you want notes older than 30 days, then $14 per user per month.</td>
+          </tr>
+          <tr>
+            <th scope="row">Where your speech is transcribed</th>
+            <td class="us"><strong>On your Mac, always.</strong> Neural Engine.</td>
+            <td>In the cloud, always. Their privacy page says so in those words.</td>
+            <td>On your Mac on Apple Silicon. Cloud models optional.</td>
+            <td>Their servers (AWS, in the US).</td>
+          </tr>
+          <tr>
+            <th scope="row">Where your transcripts live</th>
+            <td class="us"><strong>One SQLite file</strong> in your Library folder.</td>
+            <td>Wispr's cloud. Dictation storage is a setting; meeting transcripts are stored there for syncing.</td>
+            <td>On your device.</td>
+            <td>Their servers.</td>
+          </tr>
+          <tr>
+            <th scope="row">Account required</th>
+            <td class="us"><strong>No.</strong></td>
+            <td>Yes.</td>
+            <td>Yes, for a licence.</td>
+            <td>Yes.</td>
+          </tr>
+          <tr>
+            <th scope="row">Meetings recorded without a bot joining</th>
+            <td class="us"><strong>Yes.</strong> Core Audio tap on the Mac.</td>
+            <td>Yes, on Mac.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+          </tr>
+          <tr>
+            <th scope="row">Your AI coding agents can read your notes</th>
+            <td class="us"><strong>Yes.</strong> Local MCP server, read-only.</td>
+            <td>None listed.</td>
+            <td>None listed.</td>
+            <td>On the Business plan, through their cloud.</td>
+          </tr>
+          <tr>
+            <th scope="row">Source you can read</th>
+            <td class="us"><strong>Yes.</strong> MIT or Apache-2.0.</td>
+            <td>No.</td>
+            <td>No.</td>
+            <td>No.</td>
+          </tr>
+          <tr class="honest">
+            <th scope="row">iPhone app</th>
+            <td class="us">Not yet.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+          </tr>
+          <tr class="honest">
+            <th scope="row">Windows</th>
+            <td class="us">No. Hark is built on Apple's Neural Engine and stays a Mac app.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+            <td>Yes.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      Read from each vendor's own pricing and privacy pages on 8 September
+      2026: <a href="https://wisprflow.ai/pricing">Wispr Flow</a>
+      (<a href="https://wisprflow.ai/privacy">privacy</a>),
+      <a href="https://superwhisper.com/">superwhisper</a>, and
+      <a href="https://www.granola.ai/pricing">Granola</a>
+      (<a href="https://docs.granola.ai/help-center/policies/privacy-policy">privacy</a>).
+      They change their plans; if a cell is out of date,
+      <a href="https://github.com/tjameswilliams/hark/issues">tell us</a> and it
+      gets fixed. Hark's speech model is NVIDIA Parakeet, the same family
+      superwhisper offers in its paid tier.
+    </p>
+  </section>
+
+  <section class="prose">
+    <h2>What stays on your Mac</h2>
+    <p>Everything, with one exception you control.</p>
+    <ul>
+      <li><strong>Audio</strong> is transcribed on the Neural Engine and discarded. Meeting recordings are kept only if processing fails, so you can retry.</li>
+      <li><strong>Transcripts, embeddings and speaker profiles</strong> live in one SQLite file under your Library folder.</li>
+      <li><strong>The exception:</strong> the cleanup step sends each transcript's text to an OpenAI-compatible endpoint of your choosing. Point it at LM Studio or Ollama and nothing leaves the machine. Point it at a cloud API and that text does. It is off until you turn it on.</li>
+      <li><strong>No telemetry, no crash reporting, no accounts, no update pings.</strong> The site you are reading is the only server involved, and it only serves the download.</li>
+    </ul>
+    <p>
+      <a href="/privacy">The full privacy page</a> says the same thing at
+      more length.
+    </p>
+  </section>
+</Base>

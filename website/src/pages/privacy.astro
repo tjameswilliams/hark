@@ -1,0 +1,77 @@
+---
+import Base from "../layouts/Base.astro";
+---
+
+<Base
+  title="Privacy | Hark"
+  ogTitle="Hark collects nothing."
+  description="Hark collects nothing. Audio is transcribed on your Mac, transcripts stay in a local database, and the only outbound traffic is the cleanup endpoint you configure."
+  ogDescription="Audio is transcribed on your Mac and transcripts stay in a local database. There is no server."
+  image="/og/privacy.png"
+  imageAlt="The Hark mark over the line: Hark collects nothing. Audio and transcripts stay on your Mac."
+>
+  <section class="hero">
+    <h1>Privacy</h1>
+    <p class="lede">Hark collects nothing.</p>
+  </section>
+
+  <section class="prose">
+    <p class="note">Last updated 8 September 2026.</p>
+
+    <p>That is the whole policy. Here is what it means concretely.</p>
+
+    <h2>What the app does with your data</h2>
+    <ul>
+      <li><strong>Audio.</strong> Microphone and meeting audio is transcribed on your Mac's Neural Engine and then discarded. A meeting recording is kept on disk only if transcription fails, so you can retry it; you can delete it at any time.</li>
+      <li><strong>Transcripts.</strong> Stored in one SQLite database under <code>~/Library/Application Support/Hark</code>, along with the embeddings used for search and the speaker profiles used to tell voices apart. Deleting that folder deletes everything.</li>
+      <li><strong>No servers of ours.</strong> There is no backend. Hark has no account system, no sync, no analytics, no crash reporting and no update check that reports anything about you.</li>
+    </ul>
+
+    <h2>What can leave your Mac</h2>
+    <p>Two things, both only when you set them up and both to services you control.</p>
+    <ul>
+      <li>
+        <strong>The cleanup endpoint.</strong> If you turn on transcript
+        cleanup, the text of each dictation (never the audio) is sent to the
+        OpenAI-compatible endpoint you configure. That can be a local server
+        such as LM Studio or Ollama, in which case nothing leaves the
+        machine, or a cloud provider, in which case that provider's policy
+        applies. Cleanup is off by default.
+      </li>
+      <li>
+        <strong>The Ask feature.</strong> Asking a question over your
+        knowledge base sends the question and the matching transcript
+        passages to the same endpoint. Same rules.
+      </li>
+    </ul>
+
+    <h2>Model downloads</h2>
+    <p>
+      On first use Hark fetches the speech, diarization and embedding models
+      from their publishers (FluidInference on Hugging Face, and the fastembed
+      model host). Those are ordinary file downloads; they carry no
+      information about you beyond your IP address, as any download does.
+    </p>
+
+    <h2>The MCP server</h2>
+    <p>
+      <code>hark-mcp</code> lets AI coding tools on your Mac read your
+      transcripts. It runs locally over standard input and output, opens the
+      database read-only, and exposes nothing to the network. What those
+      tools do with the text they read is governed by their own policies;
+      Hark does not send anything to them on its own.
+    </p>
+
+    <h2>Retention and deletion</h2>
+    <p>
+      We hold no data, so there is nothing to retain and nothing to request
+      deletion of. Uninstalling Hark and removing its Application Support
+      folder removes everything it ever stored.
+    </p>
+
+    <h2>Contact</h2>
+    <p>
+      Questions: <a href="https://github.com/tjameswilliams/hark/issues">open an issue</a>.
+    </p>
+  </section>
+</Base>
