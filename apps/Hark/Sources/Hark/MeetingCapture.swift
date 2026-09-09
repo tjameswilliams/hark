@@ -682,7 +682,8 @@ private final class MeetingCaptureIO: @unchecked Sendable {
 /// written up front, samples are appended as they arrive, and finish()
 /// patches the RIFF/data sizes (the spike's WavFile, made streaming).
 /// Touched only from the IO queue plus the post-drain finish()/abandon().
-private final class WavStreamWriter: @unchecked Sendable {
+/// Also used by CaptureDump for one-shot dictation captures.
+final class WavStreamWriter: @unchecked Sendable {
     private let url: URL
     private let handle: FileHandle
     private var dataBytes: UInt32 = 0

@@ -56,6 +56,36 @@ enum AudioInputDevices {
         return AudioInputDevice(id: id, uid: uid, name: name)
     }
 
+    /// A non-Bluetooth input to fall back to when a Bluetooth mic goes
+    /// silent: the built-in microphone when present, else the first wired
+    /// input. Nil when every input is Bluetooth (or there are none).
+    static func wiredFallback() -> AudioInputDevice? {
+        let wired = list().filter { !isBluetooth($0.id) }
+        return wired.first { transportType($0.id) == kAudioDeviceTransportTypeBuiltIn }
+            ?? wired.first
+    }
+
+    private static func transportType(_ id: AudioDeviceID) -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &transport) == noErr else {
+            return 0
+        }
+        return transport
+    }
+
+    /// Whether the device reaches the Mac over Bluetooth (classic HFP/A2DP or
+    /// LE). Unknown transport counts as wired.
+    static func isBluetooth(_ id: AudioDeviceID) -> Bool {
+        let transport = transportType(id)
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
     private static func inputStreamCount(_ id: AudioDeviceID) -> Int {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreams,

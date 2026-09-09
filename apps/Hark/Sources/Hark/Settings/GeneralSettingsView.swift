@@ -26,6 +26,8 @@ struct GeneralSettingsView: View {
         let stored = UserDefaults.standard.integer(forKey: "micIdleMinutes")
         return stored > 0 ? stored : 15
     }()
+    @State private var dumpCaptures: Bool =
+        UserDefaults.standard.bool(forKey: CaptureDump.defaultsKey)
 
     var body: some View {
         Form {
@@ -79,7 +81,28 @@ struct GeneralSettingsView: View {
                     }
                 }
             } footer: {
-                Text("Hark keeps the audio engine warm for instant capture. Pausing releases the microphone (and its indicator light) after a quiet stretch; the next press wakes it in about a quarter second.")
+                Text("Hark keeps the audio engine warm for instant capture. Pausing releases the microphone (and its indicator light) after a quiet stretch; the next press wakes it in about a quarter second. Bluetooth headphones always pause after \(DictationPipeline.bluetoothIdleMinutes) minutes: holding their microphone open keeps them in call-quality mode for every other app.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Keep a copy of each dictation's audio", isOn: $dumpCaptures)
+                    .onChange(of: dumpCaptures) { _, newValue in
+                        UserDefaults.standard.set(newValue, forKey: CaptureDump.defaultsKey)
+                        harkLog("capture dumps \(newValue ? "enabled" : "disabled") (\(CaptureDump.directory.path)).")
+                    }
+                if dumpCaptures {
+                    Button("Show Captures in Finder") {
+                        try? FileManager.default.createDirectory(
+                            at: CaptureDump.directory, withIntermediateDirectories: true)
+                        NSWorkspace.shared.open(CaptureDump.directory)
+                    }
+                }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("For troubleshooting a dictation that comes back empty or wrong. Each capture is saved exactly as the speech model heard it, in Library/Application Support/Hark/captures; only the newest \(CaptureDump.keep) are kept. Leave this off normally.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
