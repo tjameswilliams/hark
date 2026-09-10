@@ -81,7 +81,7 @@ struct GeneralSettingsView: View {
                     }
                 }
             } footer: {
-                Text("Hark keeps the audio engine warm for instant capture. Pausing releases the microphone (and its indicator light) after a quiet stretch; the next press wakes it in about a quarter second. Bluetooth headphones always pause after \(DictationPipeline.bluetoothIdleMinutes) minutes: holding their microphone open keeps them in call-quality mode for every other app.")
+                Text("Hark keeps the audio engine warm for instant capture. Pausing releases the microphone (and its indicator light) after a quiet stretch; the next press wakes it in about a quarter second. With Bluetooth headphones and this off, Hark still releases their microphone after \(DictationPipeline.bluetoothAwayMinutes) minutes without any keyboard or mouse activity, and takes it back on your next keystroke: holding it open keeps the headphones in call-quality mode for every other app, and their link needs a couple of seconds to carry audio after a wake-up.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
