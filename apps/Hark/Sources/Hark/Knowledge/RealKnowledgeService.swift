@@ -73,6 +73,33 @@ final class RealKnowledgeService: KnowledgeService {
         try store().sessionTranscript(id: sessionId)
     }
 
+    // MARK: - Speakers
+
+    func speakers(sessionId: Int64) throws -> [ReviewSpeaker] {
+        try store().meetingSpeakers(sessionId: sessionId).map(ReviewSpeaker.init)
+    }
+
+    func knownPeople() throws -> [String] {
+        try store().listPeople().map(\.name)
+    }
+
+    func audioPath(sessionId: Int64) throws -> String? {
+        guard let path = try store().sessionAudioPath(id: sessionId),
+            FileManager.default.fileExists(atPath: path)
+        else { return nil }
+        return path
+    }
+
+    func nameSpeakers(sessionId: Int64, speakers: [ReviewSpeaker]) throws {
+        let assignments = speakers.map { speaker in
+            let name = speaker.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return SpeakerAssignment(label: speaker.label, name: name.isEmpty ? nil : name)
+        }
+        try store().setMeetingSpeakers(sessionId: sessionId, assignments: assignments)
+        let named = assignments.compactMap(\.name)
+        harkLog("knowledge: session #\(sessionId) speakers set (\(named.isEmpty ? "none named" : named.joined(separator: ", "))).")
+    }
+
     // MARK: - Search & indexing
 
     func search(

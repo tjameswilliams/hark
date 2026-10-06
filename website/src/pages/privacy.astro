@@ -16,14 +16,16 @@ import Base from "../layouts/Base.astro";
   </section>
 
   <section class="prose">
-    <p class="note">Last updated 8 September 2026.</p>
+    <p class="note">Last updated 5 October 2026.</p>
 
     <p>That is the whole policy. Here is what it means concretely.</p>
 
     <h2>What the app does with your data</h2>
     <ul>
-      <li><strong>Audio.</strong> Microphone and meeting audio is transcribed on your Mac's Neural Engine and then discarded. A meeting recording is kept on disk only if transcription fails, so you can retry it; you can delete it at any time.</li>
-      <li><strong>Transcripts.</strong> Stored in one SQLite database under <code>~/Library/Application Support/Hark</code>, along with the embeddings used for search and the speaker profiles used to tell voices apart. Deleting that folder deletes everything.</li>
+      <li><strong>Dictation audio.</strong> Transcribed on your Mac's Neural Engine and then discarded. The one exception is a troubleshooting option, off by default, that keeps the newest 20 dictations as audio files until you turn it off.</li>
+      <li><strong>Meeting recordings.</strong> Transcribed on your Mac's Neural Engine and kept as audio files under <code>~/Library/Application Support/Hark/recordings</code>. Hark keeps them so you can play back a few seconds of each voice when you say who spoke, and so a meeting can be processed again if transcription fails. They never leave your Mac, and you can delete any of them at any time; the transcript stays.</li>
+      <li><strong>Transcripts.</strong> Stored in one SQLite database under <code>~/Library/Application Support/Hark</code>, along with the embeddings used for search. Deleting that folder deletes everything.</li>
+      <li><strong>Voiceprints.</strong> To tell the voices in a meeting apart, and to recognize someone you have named when they speak in a later meeting, Hark keeps a voiceprint for each speaker: a short list of numbers describing how they sound. Voiceprints are biometric data. They are computed on your Mac, stored in the same database, and never sent anywhere. A voiceprint is only tied to a name when you type that name yourself, after a meeting or later from the library, and Hark learns a person's voice only from meetings where you confirmed it. Forgetting a person in Settings &gt; People erases their voiceprints and takes their name off every transcript.</li>
       <li><strong>No servers of ours.</strong> There is no backend. Hark has no account system, no sync, no analytics, no crash reporting and no update check that reports anything about you.</li>
     </ul>
 

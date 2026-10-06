@@ -27,7 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.knowledge = knowledge
         let mainWindow = MainWindowController(knowledge: knowledge)
         self.mainWindowController = mainWindow
-        let settingsWindow = SettingsWindowController(pipeline: pipeline)
+        let settingsWindow = SettingsWindowController(
+            pipeline: pipeline, onPeopleChanged: { [weak knowledge] in knowledge?.indexSoon() })
         self.settingsWindowController = settingsWindow
         self.statusController = StatusItemController(
             pipeline: pipeline, meeting: meeting, mainWindow: mainWindow,

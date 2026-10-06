@@ -42,6 +42,15 @@ protocol KnowledgeService: AnyObject {
     func assignSession(sessionId: Int64, projectId: Int64?) throws
     func listSessions(kind: String?, projectId: Int64?, limit: UInt32, offset: UInt32) throws -> [KSessionSummary]
     func transcript(sessionId: Int64) throws -> String
+    /// A meeting's voices, longest talker first; empty for dictations.
+    func speakers(sessionId: Int64) throws -> [ReviewSpeaker]
+    /// Names of everyone named in any meeting, to pick from.
+    func knownPeople() throws -> [String]
+    /// The meeting's recording, or nil when there is none on disk any more.
+    func audioPath(sessionId: Int64) throws -> String?
+    /// Sets who each of `speakers` is from its `name` (blank = unnamed). A
+    /// name confirms that voice as that person.
+    func nameSpeakers(sessionId: Int64, speakers: [ReviewSpeaker]) throws
     func search(query: String, projectId: Int64?, kind: String?, limit: UInt32) async throws -> [KSearchHit]
     func indexPending() async throws -> UInt32
 }
@@ -239,6 +248,12 @@ final class MockKnowledgeService: KnowledgeService {
         }
         return s.chunks.map(\.text).joined(separator: "\n\n")
     }
+
+    // The mock has no voices to name.
+    func speakers(sessionId: Int64) throws -> [ReviewSpeaker] { [] }
+    func knownPeople() throws -> [String] { [] }
+    func audioPath(sessionId: Int64) throws -> String? { nil }
+    func nameSpeakers(sessionId: Int64, speakers: [ReviewSpeaker]) throws {}
 
     // MARK: Search
 

@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-// The Settings window: dictation hotkey, transcript cleanup, general app
-// behavior, and the "Connect to AI tools" (MCP) walkthrough. Same pattern as
+// The Settings window: dictation hotkey, transcript cleanup, the people Hark
+// recognizes by voice, general app behavior, and the "Connect to AI tools" (MCP) walkthrough. Same pattern as
 // MainWindowController: one reusable code-only NSWindowController hosting a
 // SwiftUI root, shown from the status menu. The app stays .accessory — no
 // Dock icon; HarkMainWindow routes the ⌘-key equivalents itself.
@@ -11,7 +11,9 @@ import SwiftUI
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let pipeline: DictationPipeline
 
-    init(pipeline: DictationPipeline) {
+    /// `onPeopleChanged` fires when a person is renamed or forgotten (the
+    /// search index embeds speaker names, so it has to be rebuilt).
+    init(pipeline: DictationPipeline, onPeopleChanged: @escaping () -> Void) {
         self.pipeline = pipeline
         let window = HarkMainWindow(
             contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
@@ -22,7 +24,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.minSize = NSSize(width: 560, height: 480)
         window.center()
         window.setFrameAutosaveName("HarkSettingsWindow")
-        window.contentView = NSHostingView(rootView: SettingsRootView(pipeline: pipeline))
+        window.contentView = NSHostingView(
+            rootView: SettingsRootView(pipeline: pipeline, onPeopleChanged: onPeopleChanged))
         super.init(window: window)
         window.delegate = self
     }
@@ -48,6 +51,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
 struct SettingsRootView: View {
     let pipeline: DictationPipeline
+    let onPeopleChanged: () -> Void
 
     var body: some View {
         TabView {
@@ -57,6 +61,8 @@ struct SettingsRootView: View {
                 .tabItem { Label("Cleanup", systemImage: "wand.and.stars") }
             DictionarySettingsView(pipeline: pipeline)
                 .tabItem { Label("Dictionary", systemImage: "character.book.closed") }
+            PeopleSettingsView(pipeline: pipeline, onChange: onPeopleChanged)
+                .tabItem { Label("People", systemImage: "person.wave.2") }
             GeneralSettingsView(pipeline: pipeline)
                 .tabItem { Label("General", systemImage: "gearshape") }
             MCPSettingsView()

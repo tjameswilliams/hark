@@ -96,6 +96,16 @@ final class KnowledgeModel {
     private(set) var selectedHeader: SessionHeader?
     private(set) var transcriptText: String?
     private(set) var transcriptError: String?
+    /// The selected meeting's voices while the "who spoke?" sheet is open.
+    var speakerEditing: SpeakerEditing?
+
+    struct SpeakerEditing: Identifiable {
+        /// Session id.
+        let id: Int64
+        let speakers: [ReviewSpeaker]
+        let knownPeople: [String]
+        let audioPath: String?
+    }
 
     // Ask
     var askMessages: [AskMessage] = []
@@ -265,6 +275,39 @@ final class KnowledgeModel {
         } catch {
             transcriptText = nil
             transcriptError = "Couldn't load the transcript: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: Speaker actions
+
+    func editSpeakersOfSelectedSession() {
+        guard let id = selectedSessionId else { return }
+        do {
+            speakerEditing = SpeakerEditing(
+                id: id,
+                speakers: try service.speakers(sessionId: id),
+                knownPeople: try service.knownPeople(),
+                audioPath: try service.audioPath(sessionId: id))
+        } catch {
+            actionError = "Couldn't load the speakers: \(error.localizedDescription)"
+        }
+    }
+
+    func saveSpeakers(_ editing: SpeakerEditing) {
+        do {
+            try service.nameSpeakers(sessionId: editing.id, speakers: editing.speakers)
+            if selectedSessionId == editing.id { loadTranscript(editing.id) }
+            reloadSessions()
+            // Names are part of what search embeds; rebuild this session.
+            Task { [service] in
+                do {
+                    _ = try await service.indexPending()
+                } catch {
+                    harkLog("knowledge: re-indexing after naming speakers failed (non-fatal): \(error)")
+                }
+            }
+        } catch {
+            actionError = "Couldn't save the speakers: \(error.localizedDescription)"
         }
     }
 

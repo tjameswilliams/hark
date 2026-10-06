@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::db::Db;
 use crate::knowledge::{self, Embedder};
+use crate::speakers::{self, Verdict};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
@@ -49,6 +50,61 @@ pub struct MeetingSegmentInput {
     pub t_end_ms: i64,
     pub text: String,
     pub confidence: Option<f64>,
+}
+
+/// What the diarizer learned about one label, handed over with the meeting.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MeetingSpeakerInput {
+    /// Matches `MeetingSegmentInput.speaker_label`.
+    pub label: String,
+    /// Speaker embedding averaged over the label's speech; empty when none
+    /// could be computed.
+    pub voiceprint: Vec<f32>,
+    pub talk_ms: i64,
+    /// Share (0…1) of the label's audio energy that arrived on the mic
+    /// channel: near 1 for the person at this Mac, near 0 for remote voices.
+    pub mic_share: f64,
+    /// The stretch of the recording that best represents this voice.
+    pub clip_start_ms: i64,
+    pub clip_end_ms: i64,
+}
+
+/// One label of a stored meeting, for the "who is this?" step.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MeetingSpeakerRecord {
+    pub label: String,
+    /// The person this label is assigned to; None while it is unnamed.
+    pub name: Option<String>,
+    /// True once the user has confirmed `name` (as opposed to a voice match
+    /// applied automatically).
+    pub confirmed: bool,
+    /// For an unnamed label: a person it sounds like, not sure enough to apply.
+    pub suggested_name: Option<String>,
+    /// Voice distance behind `name` (when matched) or `suggested_name`.
+    pub match_distance: Option<f64>,
+    pub talk_ms: Option<i64>,
+    pub mic_share: Option<f64>,
+    pub clip_start_ms: Option<i64>,
+    pub clip_end_ms: Option<i64>,
+}
+
+/// The user's answer for one label: a name, or None to leave it unnamed.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SpeakerAssignment {
+    pub label: String,
+    pub name: Option<String>,
+}
+
+/// A named person Hark can recognize by voice.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PersonRecord {
+    pub id: i64,
+    pub name: String,
+    /// Meetings they are named in.
+    pub meeting_count: i64,
+    /// Confirmed voiceprints backing recognition; 0 means named but never
+    /// with enough speech to learn their voice.
+    pub voiceprint_count: i64,
 }
 
 /// One stored meeting, as listed in the menu / UI.
@@ -258,8 +314,11 @@ impl HarkStore {
     }
 
     /// Saves a fully processed (transcribed + diarized) meeting in one
-    /// transaction: the session, one speaker row per distinct label, the
-    /// label mapping, and every segment. Returns the meeting session id.
+    /// transaction: the session, a speaker per distinct label, the label
+    /// mapping, and every segment. A label whose voiceprint matches a known
+    /// person is assigned to them straight away (unconfirmed until the user
+    /// reviews it); the rest get a per-meeting placeholder. `speakers` may
+    /// omit labels, or be empty. Returns the meeting session id.
     pub fn record_meeting(
         &self,
         title: Option<String>,
@@ -267,6 +326,7 @@ impl HarkStore {
         ended_at: String,
         audio_path: Option<String>,
         segments: Vec<MeetingSegmentInput>,
+        speakers: Vec<MeetingSpeakerInput>,
     ) -> Result<i64, HarkError> {
         let mut db = self.db.lock().expect("hark db lock poisoned");
         check_writable(&db)?;
@@ -279,24 +339,59 @@ impl HarkStore {
         )?;
         let session_id = tx.last_insert_rowid();
 
-        // One speaker row per distinct diarizer label, in first-seen order.
-        // Cross-meeting speaker identity (voiceprints) comes later; for now
-        // every meeting gets its own speaker rows.
+        // One mapping per distinct diarizer label, in first-seen order.
+        let people = speakers::load_people(&tx)?;
         let mut speaker_ids: Vec<(String, i64)> = Vec::new();
         for segment in &segments {
-            if !speaker_ids.iter().any(|(label, _)| label == &segment.speaker_label) {
-                tx.execute(
-                    "INSERT INTO speakers (display_name) VALUES (?1)",
-                    [&segment.speaker_label],
-                )?;
-                let speaker_id = tx.last_insert_rowid();
-                tx.execute(
-                    "INSERT INTO session_speakers (session_id, speaker_id, label)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![session_id, speaker_id, segment.speaker_label],
-                )?;
-                speaker_ids.push((segment.speaker_label.clone(), speaker_id));
+            let label = &segment.speaker_label;
+            if speaker_ids.iter().any(|(seen, _)| seen == label) {
+                continue;
             }
+            let profile = speakers.iter().find(|p| &p.label == label);
+            let verdict = profile
+                .map(|p| speakers::identify(&people, &p.voiceprint, p.talk_ms))
+                .unwrap_or(Verdict::Unknown);
+            let (matched, suggested, distance) = match verdict {
+                Verdict::Match { speaker_id, distance } => {
+                    (Some(speaker_id), Some(speaker_id), Some(distance as f64))
+                }
+                Verdict::Suggest { speaker_id, distance } => {
+                    (None, Some(speaker_id), Some(distance as f64))
+                }
+                Verdict::Unknown => (None, None, None),
+            };
+            let speaker_id = match matched {
+                Some(id) => id,
+                None => {
+                    tx.execute(
+                        "INSERT INTO speakers (display_name, named) VALUES (?1, 0)",
+                        [label],
+                    )?;
+                    tx.last_insert_rowid()
+                }
+            };
+            let voiceprint = profile
+                .and_then(|p| speakers::normalized(&p.voiceprint))
+                .map(|v| knowledge::embedding_to_blob(&v));
+            tx.execute(
+                "INSERT INTO session_speakers
+                     (session_id, speaker_id, label, voiceprint, talk_ms, mic_share,
+                      clip_start_ms, clip_end_ms, suggested_speaker_id, match_distance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    session_id,
+                    speaker_id,
+                    label,
+                    voiceprint,
+                    profile.map(|p| p.talk_ms),
+                    profile.map(|p| p.mic_share),
+                    profile.map(|p| p.clip_start_ms),
+                    profile.map(|p| p.clip_end_ms),
+                    suggested,
+                    distance
+                ],
+            )?;
+            speaker_ids.push((label.clone(), speaker_id));
         }
 
         for segment in &segments {
@@ -306,11 +401,12 @@ impl HarkStore {
                 .map(|(_, id)| *id);
             tx.execute(
                 "INSERT INTO segments
-                     (session_id, speaker_id, t_start_ms, t_end_ms, text, confidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (session_id, speaker_id, speaker_label, t_start_ms, t_end_ms, text, confidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     session_id,
                     speaker_id,
+                    segment.speaker_label,
                     segment.t_start_ms,
                     segment.t_end_ms,
                     segment.text,
@@ -323,6 +419,122 @@ impl HarkStore {
         Ok(session_id)
     }
 
+    // -- Speaker identity ----------------------------------------------------
+
+    /// A meeting's labels with who they are (or might be), longest talker
+    /// first — the rows of the "who is this?" step.
+    pub fn meeting_speakers(&self, session_id: i64) -> Result<Vec<MeetingSpeakerRecord>, HarkError> {
+        let db = self.db.lock().expect("hark db lock poisoned");
+        let mut stmt = db.conn().prepare(
+            "SELECT ss.label, sp.display_name, sp.named, ss.confirmed,
+                    sug.display_name, ss.match_distance, ss.talk_ms, ss.mic_share,
+                    ss.clip_start_ms, ss.clip_end_ms
+             FROM session_speakers ss
+             JOIN speakers sp ON sp.id = ss.speaker_id
+             LEFT JOIN speakers sug ON sug.id = ss.suggested_speaker_id AND sug.named = 1
+             WHERE ss.session_id = ?1
+             ORDER BY coalesce(ss.talk_ms, 0) DESC, ss.label",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            let named: bool = row.get(2)?;
+            let confirmed: bool = row.get(3)?;
+            Ok(MeetingSpeakerRecord {
+                label: row.get(0)?,
+                name: if named { row.get(1)? } else { None },
+                confirmed: named && confirmed,
+                suggested_name: if named { None } else { row.get(4)? },
+                // A distance only means something next to the match or
+                // suggestion it explains.
+                match_distance: if confirmed { None } else { row.get(5)? },
+                talk_ms: row.get(6)?,
+                mic_share: row.get(7)?,
+                clip_start_ms: row.get(8)?,
+                clip_end_ms: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Applies the user's answers for a meeting's labels in one transaction.
+    /// A name confirms the label as that person (created if new), so its
+    /// voiceprint is used to recognize them from then on; None returns the
+    /// label to an unnamed placeholder. Labels not mentioned are untouched.
+    pub fn set_meeting_speakers(
+        &self,
+        session_id: i64,
+        assignments: Vec<SpeakerAssignment>,
+    ) -> Result<(), HarkError> {
+        let mut db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        let tx = db.conn_mut().transaction()?;
+        let mut changed = false;
+        for assignment in &assignments {
+            changed |= speakers::assign_label(
+                &tx,
+                session_id,
+                &assignment.label,
+                assignment.name.as_deref(),
+            )?;
+        }
+        if changed {
+            speakers::invalidate_index(&tx, session_id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Everyone the user has named in a meeting, alphabetically.
+    pub fn list_people(&self) -> Result<Vec<PersonRecord>, HarkError> {
+        let db = self.db.lock().expect("hark db lock poisoned");
+        let mut stmt = db.conn().prepare(
+            "SELECT sp.id, sp.display_name,
+                    count(DISTINCT ss.session_id),
+                    count(CASE WHEN ss.confirmed = 1 AND ss.voiceprint IS NOT NULL
+                                    AND ss.talk_ms >= ?1 THEN 1 END)
+             FROM speakers sp
+             JOIN session_speakers ss ON ss.speaker_id = sp.id
+             WHERE sp.named = 1
+             GROUP BY sp.id
+             ORDER BY sp.display_name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([speakers::MIN_ENROLL_MS], |row| {
+            Ok(PersonRecord {
+                id: row.get(0)?,
+                name: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                meeting_count: row.get(2)?,
+                voiceprint_count: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Renames a person everywhere. Renaming onto an existing person's name
+    /// merges the two.
+    pub fn rename_person(&self, id: i64, name: String) -> Result<(), HarkError> {
+        let mut db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        let tx = db.conn_mut().transaction()?;
+        for session_id in speakers::rename_person(&tx, id, &name)? {
+            speakers::invalidate_index(&tx, session_id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forgets a person: removes their name from every meeting and erases
+    /// their voiceprints. Transcripts keep the words under the original
+    /// per-meeting labels.
+    pub fn forget_person(&self, id: i64) -> Result<(), HarkError> {
+        let mut db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        let tx = db.conn_mut().transaction()?;
+        for session_id in speakers::forget_person(&tx, id)? {
+            speakers::invalidate_index(&tx, session_id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Most recent meetings, newest first.
     pub fn recent_meetings(&self, limit: u32) -> Result<Vec<MeetingRecord>, HarkError> {
         let db = self.db.lock().expect("hark db lock poisoned");
@@ -330,7 +542,7 @@ impl HarkStore {
         let mut stmt = conn.prepare(
             "SELECT s.id, s.title, s.started_at, s.ended_at, s.audio_path,
                     (SELECT count(*) FROM segments WHERE session_id = s.id),
-                    (SELECT count(*) FROM session_speakers WHERE session_id = s.id)
+                    (SELECT count(DISTINCT speaker_id) FROM session_speakers WHERE session_id = s.id)
              FROM sessions s
              WHERE s.kind = 'meeting'
              ORDER BY s.id DESC
@@ -363,6 +575,21 @@ impl HarkStore {
     pub fn session_transcript(&self, id: i64) -> Result<String, HarkError> {
         let db = self.db.lock().expect("hark db lock poisoned");
         transcript_for(db.conn(), id)
+    }
+
+    /// Where a session's recording was written, if it has one. The file may
+    /// since have been deleted.
+    pub fn session_audio_path(&self, id: i64) -> Result<Option<String>, HarkError> {
+        let db = self.db.lock().expect("hark db lock poisoned");
+        let path: Option<Option<String>> = db
+            .conn()
+            .query_row("SELECT audio_path FROM sessions WHERE id = ?1", [id], |row| row.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(path.flatten())
     }
 
     /// Permanently deletes one dictation (cascades to segments/notes).
@@ -865,7 +1092,7 @@ impl HarkStore {
         let mut stmt = db.conn().prepare(
             "SELECT s.id, s.kind, s.title, s.started_at, s.project_id,
                     (SELECT count(*) FROM segments WHERE session_id = s.id),
-                    (SELECT count(*) FROM session_speakers WHERE session_id = s.id),
+                    (SELECT count(DISTINCT speaker_id) FROM session_speakers WHERE session_id = s.id),
                     coalesce((SELECT group_concat(text, ' ') FROM (
                         SELECT text FROM segments
                         WHERE session_id = s.id
@@ -1055,8 +1282,12 @@ mod tests {
                 "2026-08-31T15:30:00Z".into(),
                 Some("/tmp/mtg.wav".into()),
                 segments,
+                vec![],
             )
             .unwrap();
+
+        assert_eq!(store.session_audio_path(id).unwrap().as_deref(), Some("/tmp/mtg.wav"));
+        assert_eq!(store.session_audio_path(id + 1).unwrap(), None);
 
         let meetings = store.recent_meetings(10).unwrap();
         assert_eq!(meetings.len(), 1);
@@ -1067,6 +1298,191 @@ mod tests {
         assert!(transcript.starts_with("[00:00] SPEAKER_00: Let's talk"));
         assert!(transcript.contains("[00:04] SPEAKER_01: Agreed"));
         assert!(transcript.contains("[01:07] SPEAKER_00: Done then."));
+    }
+
+    fn temp_store(tag: &str) -> Arc<HarkStore> {
+        let dir = std::env::temp_dir().join(format!("hark-ffi-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("test.sqlite{suffix}")));
+        }
+        HarkStore::open(path.to_string_lossy().into_owned()).unwrap()
+    }
+
+    /// A 16-d stand-in voiceprint: mostly along `axis`, tilted `tilt` towards
+    /// the next axis so repeat appearances of a voice are close, not equal.
+    fn voice(axis: usize, tilt: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; 16];
+        v[axis] = 1.0;
+        v[axis + 1] = tilt;
+        v
+    }
+
+    /// Records a meeting of (label, voiceprint, talk_ms) speakers, one
+    /// segment each, and returns its id.
+    fn meeting_with(store: &HarkStore, speakers: &[(&str, Vec<f32>, i64)]) -> i64 {
+        let segments = speakers
+            .iter()
+            .enumerate()
+            .map(|(i, (label, _, _))| MeetingSegmentInput {
+                speaker_label: label.to_string(),
+                t_start_ms: i as i64 * 5000,
+                t_end_ms: i as i64 * 5000 + 4000,
+                text: format!("{label} speaking"),
+                confidence: None,
+            })
+            .collect();
+        let profiles = speakers
+            .iter()
+            .map(|(label, voiceprint, talk_ms)| MeetingSpeakerInput {
+                label: label.to_string(),
+                voiceprint: voiceprint.clone(),
+                talk_ms: *talk_ms,
+                mic_share: 0.0,
+                clip_start_ms: 0,
+                clip_end_ms: 4000,
+            })
+            .collect();
+        store
+            .record_meeting(
+                None,
+                "2026-10-05T15:00:00Z".into(),
+                "2026-10-05T15:30:00Z".into(),
+                None,
+                segments,
+                profiles,
+            )
+            .unwrap()
+    }
+
+    fn name_of(store: &HarkStore, session_id: i64, label: &str) -> MeetingSpeakerRecord {
+        store
+            .meeting_speakers(session_id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.label == label)
+            .unwrap()
+    }
+
+    fn assign(store: &HarkStore, session_id: i64, label: &str, name: Option<&str>) {
+        store
+            .set_meeting_speakers(
+                session_id,
+                vec![SpeakerAssignment {
+                    label: label.into(),
+                    name: name.map(Into::into),
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_named_voice_is_recognized_in_the_next_meeting() {
+        let store = temp_store("voice");
+        let first = meeting_with(
+            &store,
+            &[("SPEAKER_00", voice(0, 0.0), 120_000), ("SPEAKER_01", voice(4, 0.0), 90_000)],
+        );
+        // Nobody is known yet.
+        assert!(store.meeting_speakers(first).unwrap().iter().all(|s| s.name.is_none()));
+        assign(&store, first, "SPEAKER_00", Some("Dana"));
+        assert!(store.meeting_transcript(first).unwrap().contains("Dana: SPEAKER_00 speaking"));
+        assert!(name_of(&store, first, "SPEAKER_00").confirmed);
+
+        // Next meeting: Dana again (slightly different), in another label
+        // slot, plus a stranger and someone only vaguely like Dana.
+        let second = meeting_with(
+            &store,
+            &[
+                ("SPEAKER_00", voice(8, 0.0), 60_000),
+                ("SPEAKER_01", voice(0, 0.3), 60_000),
+                ("SPEAKER_02", voice(0, 1.3), 60_000),
+            ],
+        );
+        let dana = name_of(&store, second, "SPEAKER_01");
+        assert_eq!(dana.name.as_deref(), Some("Dana"));
+        assert!(!dana.confirmed, "a voice match is not a confirmation");
+        assert!(dana.match_distance.unwrap() < 0.1);
+        assert!(store.meeting_transcript(second).unwrap().contains("Dana: SPEAKER_01 speaking"));
+
+        let stranger = name_of(&store, second, "SPEAKER_00");
+        assert!(stranger.name.is_none() && stranger.suggested_name.is_none());
+
+        let maybe = name_of(&store, second, "SPEAKER_02");
+        assert!(maybe.name.is_none());
+        assert_eq!(maybe.suggested_name.as_deref(), Some("Dana"));
+
+        let people = store.list_people().unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!((people[0].meeting_count, people[0].voiceprint_count), (2, 1));
+    }
+
+    #[test]
+    fn unconfirmed_matches_and_short_speakers_do_not_teach() {
+        let store = temp_store("teach");
+        // 12 s of speech: enough to name, not enough to learn a voice from.
+        let first = meeting_with(&store, &[("SPEAKER_00", voice(0, 0.0), 12_000)]);
+        assign(&store, first, "SPEAKER_00", Some("Sam"));
+        assert_eq!(store.list_people().unwrap()[0].voiceprint_count, 0);
+        let second = meeting_with(&store, &[("SPEAKER_00", voice(0, 0.0), 90_000)]);
+        assert!(name_of(&store, second, "SPEAKER_00").name.is_none());
+
+        // Confirm Sam there; a third meeting now auto-matches. That match is
+        // unconfirmed, so by itself it adds no voiceprint.
+        assign(&store, second, "SPEAKER_00", Some("sam"));
+        let third = meeting_with(&store, &[("SPEAKER_00", voice(0, 0.2), 90_000)]);
+        assert_eq!(name_of(&store, third, "SPEAKER_00").name.as_deref(), Some("Sam"));
+        let people = store.list_people().unwrap();
+        assert_eq!(people.len(), 1, "names match case-insensitively");
+        assert_eq!((people[0].meeting_count, people[0].voiceprint_count), (3, 1));
+    }
+
+    #[test]
+    fn correcting_merging_and_forgetting() {
+        let store = temp_store("fix");
+        let first = meeting_with(
+            &store,
+            &[("SPEAKER_00", voice(0, 0.0), 60_000), ("SPEAKER_01", voice(0, 0.1), 60_000)],
+        );
+        // The diarizer split one person in two: naming both merges them…
+        store
+            .set_meeting_speakers(
+                first,
+                vec![
+                    SpeakerAssignment { label: "SPEAKER_00".into(), name: Some("Ravi".into()) },
+                    SpeakerAssignment { label: "SPEAKER_01".into(), name: Some("Ravi".into()) },
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.recent_meetings(1).unwrap()[0].speaker_count, 1);
+        // …and un-naming one splits exactly that label back out.
+        assign(&store, first, "SPEAKER_01", None);
+        let transcript = store.meeting_transcript(first).unwrap();
+        assert!(transcript.contains("Ravi: SPEAKER_00 speaking"), "{transcript}");
+        assert!(transcript.contains("SPEAKER_01: SPEAKER_01 speaking"), "{transcript}");
+
+        // A typo'd name leaves no stray person behind once corrected.
+        assign(&store, first, "SPEAKER_01", Some("Pryia"));
+        assign(&store, first, "SPEAKER_01", Some("Priya"));
+        let names: Vec<String> =
+            store.list_people().unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Priya", "Ravi"]);
+
+        // Renaming onto an existing person merges; forgetting erases.
+        let priya = store.list_people().unwrap()[0].id;
+        store.rename_person(priya, "ravi".into()).unwrap();
+        let people = store.list_people().unwrap();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].voiceprint_count, 2);
+
+        store.forget_person(people[0].id).unwrap();
+        assert!(store.list_people().unwrap().is_empty());
+        let transcript = store.meeting_transcript(first).unwrap();
+        assert!(transcript.contains("SPEAKER_00: SPEAKER_00 speaking"), "{transcript}");
+        let second = meeting_with(&store, &[("SPEAKER_00", voice(0, 0.0), 60_000)]);
+        let again = name_of(&store, second, "SPEAKER_00");
+        assert!(again.name.is_none() && again.suggested_name.is_none());
     }
 
     /// Two connections on one WAL file: the app's writer store and hark-mcp's

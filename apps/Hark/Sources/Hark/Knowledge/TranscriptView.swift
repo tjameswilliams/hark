@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 
 /// Detail column: the transcript of the selected session, with a header
-/// (title / date / kind), a project picker, and a copy button.
+/// (title / date / kind), a project picker, a copy button and, for meetings,
+/// the sheet for saying who each voice is.
 struct TranscriptPane: View {
     @Bindable var model: KnowledgeModel
 
@@ -40,6 +41,9 @@ struct TranscriptView: View {
                     description: Text(model.transcriptError ?? "This session has no transcript."))
             }
         }
+        .sheet(item: $model.speakerEditing) { editing in
+            SpeakerNamingSheet(editing: editing) { model.saveSpeakers(editing) }
+        }
     }
 
     private var headerView: some View {
@@ -58,6 +62,14 @@ struct TranscriptView: View {
                 }
             }
             Spacer()
+            if header.kind == "meeting" {
+                Button {
+                    model.editSpeakersOfSelectedSession()
+                } label: {
+                    Label("Speakers", systemImage: "person.wave.2")
+                }
+                .help("Say who each voice in this meeting is")
+            }
             projectMenu
             Button {
                 copyTranscript()
@@ -111,5 +123,75 @@ struct TranscriptView: View {
         pb.clearContents()
         pb.setString(text, forType: .string)
         harkLog("knowledge: copied the transcript of session #\(header.id) to the clipboard.")
+    }
+}
+
+/// "Who spoke in this meeting?" for a meeting already in the library: the
+/// same play-and-name rows as the post-meeting window.
+private struct SpeakerNamingSheet: View {
+    let editing: KnowledgeModel.SpeakerEditing
+    let save: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    private var listed: [ReviewSpeaker] { editing.speakers.filter { !$0.isBrief } }
+
+    /// Why voices can't be played, when they can't.
+    private var playbackNote: String? {
+        if !editing.speakers.contains(where: { $0.clip != nil }) {
+            return "This meeting was recorded before Hark kept voiceprints. You can name its voices, but not play them, and Hark won't learn them from it."
+        }
+        if editing.audioPath == nil {
+            return "The recording is no longer on disk, so these voices can't be played."
+        }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Who spoke in this meeting?").font(.headline)
+            if listed.isEmpty {
+                Text("No voices were told apart in this meeting.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Play a voice and say who it is. Hark learns from each one you confirm and recognizes them in later meetings.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(listed) { speaker in
+                            SpeakerRow(
+                                speaker: speaker, audioPath: editing.audioPath,
+                                knownPeople: editing.knownPeople, disabled: false)
+                            if speaker.id != listed.last?.id { Divider() }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                }
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(maxHeight: 360)
+            }
+            if let playbackNote {
+                Text(playbackNote)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    save()
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(listed.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+        .onDisappear { ClipPlayer.shared.stop() }
     }
 }

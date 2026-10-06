@@ -90,10 +90,14 @@ speaks MCP over stdio, and exposes nothing to the network.
 
 Everything, with one exception you control.
 
-- **Audio** is transcribed on the Neural Engine and discarded. A meeting
-  recording is kept only if processing fails, so you can retry.
-- **Transcripts, embeddings and speaker profiles** live in one SQLite file
+- **Audio** is transcribed on the Neural Engine. Dictation audio is then
+  discarded; meeting recordings are kept under
+  `~/Library/Application Support/Hark/recordings`, so you can play back a
+  voice when naming who spoke, until you delete them.
+- **Transcripts, embeddings and voiceprints** live in one SQLite file
   under `~/Library/Application Support/Hark`. Back it up, query it, delete it.
+  Voiceprints are how Hark recognizes someone you have named in a later
+  meeting; Settings > People forgets a person and erases theirs.
 - **The exception:** the cleanup step sends each transcript's text to an
   OpenAI-compatible endpoint of your choosing. Point it at LM Studio or Ollama
   and nothing leaves the machine. Point it at a cloud API and that text does.

@@ -2,13 +2,13 @@
 import FluidAudio
 import Foundation
 
-/// Offline meeting processing: diarization (FluidAudio DiarizerManager) +
-/// transcription (FluidAudio AsrManager, Parakeet TDT v3), merged into
-/// speaker-attributed utterances.
+/// Offline meeting processing: diarization (FluidAudio OfflineDiarizerManager,
+/// falling back to the streaming DiarizerManager) + transcription (FluidAudio
+/// AsrManager, Parakeet TDT v3), merged into speaker-attributed utterances,
+/// plus a voiceprint per speaker for cross-meeting identity.
 ///
-/// The whole file is self-contained apart from `MeetingUtterance`, which is
-/// defined elsewhere in the target. Progress is reported solely through the
-/// `progress` closure.
+/// The whole file is self-contained apart from the types in MeetingTypes.
+/// Progress is reported solely through the `progress` closure.
 @MainActor
 final class MeetingProcessor {
 
@@ -23,7 +23,7 @@ final class MeetingProcessor {
     /// Processes a recorded meeting audio file (WAV; 16 kHz 16-bit mono
     /// expected, but any AVAudioFile-readable format/rate/channel-count is
     /// converted — stereo is averaged to mono) into speaker-attributed,
-    /// time-stamped utterances.
+    /// time-stamped utterances and one profile per speaker label.
     ///
     /// `replacements` overrides the dictionary-backed default engine; the
     /// default (nil) consults `replacementProvider`, so existing callers get
@@ -32,11 +32,11 @@ final class MeetingProcessor {
         fileURL: URL,
         replacements: ReplacementEngine? = nil,
         progress: @escaping @Sendable (String) -> Void
-    ) async throws -> [MeetingUtterance] {
-        let utterances = try await runPipeline(fileURL: fileURL, progress: progress)
+    ) async throws -> MeetingProcessingResult {
+        let result = try await runPipeline(fileURL: fileURL, progress: progress)
         let engine = replacements ?? Self.replacementProvider.map { ReplacementEngine(entries: $0()) }
-        guard let engine, !engine.isEmpty else { return utterances }
-        return utterances.map { utterance in
+        guard let engine, !engine.isEmpty else { return result }
+        let corrected = result.utterances.map { utterance in
             let corrected = engine.applyReporting(utterance.text)
             for hit in corrected.fired {
                 harkLog("dictionary (meeting): \(hit.alias) -> \(hit.term)")
@@ -50,6 +50,7 @@ final class MeetingProcessor {
                 confidence: utterance.confidence
             )
         }
+        return MeetingProcessingResult(utterances: corrected, speakers: result.speakers)
     }
 
     // MARK: - Pipeline (off the main actor)
@@ -57,31 +58,15 @@ final class MeetingProcessor {
     private nonisolated static func runPipeline(
         fileURL: URL,
         progress: @escaping @Sendable (String) -> Void
-    ) async throws -> [MeetingUtterance] {
+    ) async throws -> MeetingProcessingResult {
         progress("reading audio…")
-        let samples = try loadMono16kSamples(from: fileURL)
-        guard !samples.isEmpty else { return [] }
+        let audio = try loadMono16kSamples(from: fileURL)
+        let samples = audio.samples
+        guard !samples.isEmpty else { return MeetingProcessingResult(utterances: [], speakers: []) }
 
         // --- Diarization -----------------------------------------------------
-        progress("loading diarizer models…")
-        let diarizerModels = try await DiarizerModels.downloadIfNeeded()
-        // Default config except a slightly tighter clustering threshold: with
-        // the library default (0.7) two same-language voices can sit right at
-        // the merge boundary and collapse into one speaker; 0.65 separated
-        // them reliably in verification while keeping segment boundaries
-        // identical.
-        var diarizerConfig = DiarizerConfig.default
-        diarizerConfig.clusteringThreshold = 0.65
-        let diarizer = DiarizerManager(config: diarizerConfig)
-        diarizer.initialize(models: diarizerModels)
-
-        progress("diarizing…")
-        let diarization = try diarizer.performCompleteDiarization(
-            samples, sampleRate: sampleRate
-        ) { fraction in
-            progress("diarizing… \(Int(fraction * 100))%")
-        }
-        let segments = diarization.segments.sorted { $0.startTimeSeconds < $1.startTimeSeconds }
+        let diarization = try await diarize(samples, progress: progress)
+        let segments = diarization.segments
 
         // --- ASR -------------------------------------------------------------
         progress("loading speech models…")
@@ -103,29 +88,36 @@ final class MeetingProcessor {
         if segments.isEmpty {
             // No diarization segments at all: attribute everything to one speaker.
             let text = asrResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return [] }
-            return [
-                MeetingUtterance(
-                    speakerLabel: "SPEAKER_00",
-                    tStartMs: 0,
-                    tEndMs: Int64(Double(samples.count) / Double(sampleRate) * 1000.0),
-                    text: text,
-                    confidence: Double(asrResult.confidence)
-                )
-            ]
+            guard !text.isEmpty else { return MeetingProcessingResult(utterances: [], speakers: []) }
+            return MeetingProcessingResult(
+                utterances: [
+                    MeetingUtterance(
+                        speakerLabel: "SPEAKER_00",
+                        tStartMs: 0,
+                        tEndMs: Int64(Double(samples.count) / Double(sampleRate) * 1000.0),
+                        text: text,
+                        confidence: Double(asrResult.confidence)
+                    )
+                ],
+                speakers: [])
         }
+
+        let speakers = speakerProfiles(
+            segments: segments, spans: diarization.spans, labels: labels, energy: audio.energy)
 
         if !words.isEmpty {
             // Preferred strategy: assign each recognized word to the diarizer
             // segment containing its midpoint (nearest segment when the word
             // falls in a gap), then build utterances from contiguous
             // same-speaker runs.
-            return mergeByWordTimings(words: words, segments: segments, labels: labels)
+            return MeetingProcessingResult(
+                utterances: mergeByWordTimings(words: words, segments: segments, labels: labels),
+                speakers: speakers)
         }
 
         // Fallback: no usable token timings — transcribe each diarizer
         // segment's audio slice independently.
-        return try await transcribePerSegment(
+        let utterances = try await transcribePerSegment(
             samples: samples,
             segments: segments,
             labels: labels,
@@ -133,6 +125,153 @@ final class MeetingProcessor {
             decoderLayers: decoderLayers,
             progress: progress
         )
+        return MeetingProcessingResult(utterances: utterances, speakers: speakers)
+    }
+
+    // MARK: - Diarization
+
+    /// Speaker turns plus, per diarizer speaker id, the raw embeddings behind
+    /// them (the material voiceprints are averaged from).
+    private struct Diarization {
+        let segments: [TimedSpeakerSegment]
+        let spans: [String: [VoiceSpan]]
+    }
+
+    private nonisolated static func diarize(
+        _ samples: [Float], progress: @escaping @Sendable (String) -> Void
+    ) async throws -> Diarization {
+        // Preferred: the offline pipeline, which clusters the whole meeting
+        // at once (VBx). On real recordings it found the right number of
+        // speakers where the streaming diarizer below split 3–4 people into
+        // 10 or more labels and occasionally merged two voices.
+        do {
+            progress("loading diarizer models…")
+            let offline = OfflineDiarizerManager(
+                config: OfflineDiarizerConfig(exposeChunkEmbeddings: true))
+            try await offline.prepareModels()
+            progress("diarizing…")
+            let result = try await offline.process(audio: samples) { done, total in
+                progress("diarizing… \(total > 0 ? done * 100 / total : 0)%")
+            }
+            let spans = Dictionary(grouping: result.chunkEmbeddings ?? [], by: \.speakerId)
+                .mapValues { chunks in
+                    chunks.map {
+                        VoiceSpan(
+                            start: $0.startTimeSeconds, end: $0.endTimeSeconds,
+                            embedding: $0.embedding256)
+                    }
+                }
+            return Diarization(
+                segments: result.segments.sorted { $0.startTimeSeconds < $1.startTimeSeconds },
+                spans: spans)
+        } catch {
+            // Fail open (first run without a network to fetch the offline
+            // models, say): a rougher speaker split beats no transcript.
+            progress("offline diarizer unavailable (\(error)); using the streaming diarizer…")
+        }
+
+        progress("loading diarizer models…")
+        let diarizerModels = try await DiarizerModels.downloadIfNeeded()
+        // Default config except a slightly tighter clustering threshold: with
+        // the library default (0.7) two same-language voices can sit right at
+        // the merge boundary and collapse into one speaker; 0.65 separated
+        // them reliably in verification while keeping segment boundaries
+        // identical.
+        var diarizerConfig = DiarizerConfig.default
+        diarizerConfig.clusteringThreshold = 0.65
+        let diarizer = DiarizerManager(config: diarizerConfig)
+        diarizer.initialize(models: diarizerModels)
+
+        progress("diarizing…")
+        let result = try diarizer.performCompleteDiarization(
+            samples, sampleRate: sampleRate
+        ) { fraction in
+            progress("diarizing… \(Int(fraction * 100))%")
+        }
+        let segments = result.segments.sorted { $0.startTimeSeconds < $1.startTimeSeconds }
+        let spans = Dictionary(grouping: segments, by: \.speakerId).mapValues { turns in
+            turns.map {
+                VoiceSpan(
+                    start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds),
+                    embedding: $0.embedding)
+            }
+        }
+        return Diarization(segments: segments, spans: spans)
+    }
+
+    // MARK: - Speaker profiles
+
+    /// One profile per label: voiceprint, talk time, mic share, and the clip
+    /// to play when asking who it is. Labels without a usable embedding are
+    /// left out.
+    private nonisolated static func speakerProfiles(
+        segments: [TimedSpeakerSegment],
+        spans: [String: [VoiceSpan]],
+        labels: [String: String],
+        energy: ChannelEnergy?
+    ) -> [MeetingSpeakerProfile] {
+        Dictionary(grouping: segments, by: \.speakerId).compactMap { id, turns in
+            guard let label = labels[id], let voiceSpans = spans[id],
+                let voiceprint = meanEmbedding(voiceSpans.map(\.embedding))
+            else { return nil }
+
+            // Play back the turn that sounds most like this voiceprint, not
+            // merely the longest: the diarizer occasionally files someone
+            // else's turn under a label, and the longest turn can be that
+            // stray (seen on real recordings).
+            func strayness(_ turn: TimedSpeakerSegment) -> Float {
+                let start = Double(turn.startTimeSeconds)
+                let end = Double(turn.endTimeSeconds)
+                let nearest = voiceSpans.max {
+                    min($0.end, end) - max($0.start, start) < min($1.end, end) - max($1.start, start)
+                }
+                guard let nearest, let embedding = meanEmbedding([nearest.embedding]) else { return 2 }
+                return 1 - zip(embedding, voiceprint).reduce(0) { $0 + $1.0 * $1.1 }
+            }
+            let substantial = turns.filter { $0.durationSeconds >= minimumClipSeconds }
+            guard let clip = (substantial.isEmpty ? turns : substantial)
+                .min(by: { strayness($0) < strayness($1) })
+            else { return nil }
+            let clipStart = Double(clip.startTimeSeconds)
+            let clipEnd = min(Double(clip.endTimeSeconds), clipStart + maximumClipSeconds)
+
+            var mic = 0.0
+            var system = 0.0
+            if let energy {
+                for turn in turns {
+                    let (m, s) = energy.sums(
+                        from: Double(turn.startTimeSeconds), to: Double(turn.endTimeSeconds))
+                    mic += m
+                    system += s
+                }
+            }
+            return MeetingSpeakerProfile(
+                label: label,
+                voiceprint: voiceprint,
+                talkMs: Int64(turns.reduce(0.0) { $0 + Double($1.durationSeconds) } * 1000),
+                micShare: mic + system > 0 ? mic / (mic + system) : 0,
+                clipStartMs: Int64(clipStart * 1000),
+                clipEndMs: Int64(clipEnd * 1000))
+        }
+        .sorted { $0.label < $1.label }
+    }
+
+    private nonisolated static var minimumClipSeconds: Float { 4 }
+    private nonisolated static var maximumClipSeconds: Double { 8 }
+
+    /// Mean of the embeddings, each normalized first so loud stretches don't
+    /// dominate, L2-normalized. nil when there is nothing usable to average.
+    private nonisolated static func meanEmbedding(_ embeddings: [[Float]]) -> [Float]? {
+        guard let dims = embeddings.first?.count, dims > 0 else { return nil }
+        var sum = [Float](repeating: 0, count: dims)
+        for embedding in embeddings where embedding.count == dims {
+            let norm = embedding.reduce(0) { $0 + $1 * $1 }.squareRoot()
+            guard norm > 0, norm.isFinite else { continue }
+            for i in 0..<dims { sum[i] += embedding[i] / norm }
+        }
+        let norm = sum.reduce(0) { $0 + $1 * $1 }.squareRoot()
+        guard norm > 0, norm.isFinite else { return nil }
+        return sum.map { $0 / norm }
     }
 
     // MARK: - Audio loading
@@ -141,12 +280,16 @@ final class MeetingProcessor {
 
     /// Reads any AVAudioFile-supported file, averages all channels to mono
     /// (for two-channel meeting recordings — ch0 mic, ch1 system — this is the
-    /// intended sum/2 mixdown), and resamples to 16 kHz Float32.
-    private nonisolated static func loadMono16kSamples(from url: URL) throws -> [Float] {
+    /// intended sum/2 mixdown), and resamples to 16 kHz Float32. For
+    /// two-channel files it also returns the per-channel energy envelope,
+    /// which is what tells the local speaker from the remote ones.
+    private nonisolated static func loadMono16kSamples(
+        from url: URL
+    ) throws -> (samples: [Float], energy: ChannelEnergy?) {
         let file = try AVAudioFile(forReading: url)
         let format = file.processingFormat
         let frameCount = AVAudioFrameCount(file.length)
-        guard frameCount > 0 else { return [] }
+        guard frameCount > 0 else { return ([], nil) }
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
             throw ProcessingError.audioReadFailed("could not allocate PCM buffer")
         }
@@ -168,8 +311,15 @@ final class MeetingProcessor {
             for i in 0..<frames { mono[i] *= scale }
         }
 
-        if Int(format.sampleRate) == sampleRate { return mono }
-        return try resample(mono, from: format.sampleRate, to: Double(sampleRate))
+        let energy = channels == 2
+            ? ChannelEnergy(
+                mic: UnsafeBufferPointer(start: channelData[0], count: frames),
+                system: UnsafeBufferPointer(start: channelData[1], count: frames),
+                sampleRate: format.sampleRate)
+            : nil
+
+        if Int(format.sampleRate) == sampleRate { return (mono, energy) }
+        return (try resample(mono, from: format.sampleRate, to: Double(sampleRate)), energy)
     }
 
     private nonisolated static func resample(
@@ -394,6 +544,45 @@ final class MeetingProcessor {
 }
 
 // MARK: - Supporting types (file-private)
+
+/// One stretch of speech with the speaker embedding extracted from it.
+private struct VoiceSpan: Sendable {
+    let start: Double
+    let end: Double
+    let embedding: [Float]
+}
+
+/// Per-channel energy of a two-channel meeting recording (ch0 mic, ch1
+/// system audio) in 100 ms frames — small enough to keep for any length of
+/// meeting, fine enough to attribute a speaker turn to a channel.
+private struct ChannelEnergy: Sendable {
+    private static let frameSeconds = 0.1
+    private let mic: [Double]
+    private let system: [Double]
+
+    init(mic: UnsafeBufferPointer<Float>, system: UnsafeBufferPointer<Float>, sampleRate: Double) {
+        let frame = max(1, Int(sampleRate * Self.frameSeconds))
+        func envelope(_ samples: UnsafeBufferPointer<Float>) -> [Double] {
+            stride(from: 0, to: samples.count, by: frame).map { start in
+                var sum = 0.0
+                for i in start..<min(start + frame, samples.count) {
+                    sum += Double(samples[i]) * Double(samples[i])
+                }
+                return sum
+            }
+        }
+        self.mic = envelope(mic)
+        self.system = envelope(system)
+    }
+
+    /// Energy on each channel between two times, in whole frames.
+    func sums(from start: Double, to end: Double) -> (mic: Double, system: Double) {
+        let lo = max(0, Int(start / Self.frameSeconds))
+        let hi = min(mic.count, Int((end / Self.frameSeconds).rounded(.up)))
+        guard hi > lo else { return (0, 0) }
+        return (mic[lo..<hi].reduce(0, +), system[lo..<hi].reduce(0, +))
+    }
+}
 
 private struct WordSpan: Sendable {
     let text: String

@@ -291,8 +291,8 @@ import Mark from "../components/Mark.astro";
     <h2>What stays on your Mac</h2>
     <p>Everything, with one exception you control.</p>
     <ul>
-      <li><strong>Audio</strong> is transcribed on the Neural Engine and discarded. Meeting recordings are kept only if processing fails, so you can retry.</li>
-      <li><strong>Transcripts, embeddings and speaker profiles</strong> live in one SQLite file under your Library folder.</li>
+      <li><strong>Audio</strong> is transcribed on the Neural Engine. Dictation audio is then discarded; meeting recordings are kept on your Mac, so you can play back a voice when naming who spoke, until you delete them.</li>
+      <li><strong>Transcripts, embeddings and voiceprints</strong> live in one SQLite file under your Library folder. Voiceprints are how Hark recognizes someone you have named in a later meeting; you can forget a person at any time.</li>
       <li><strong>The exception:</strong> the cleanup step sends each transcript's text to an OpenAI-compatible endpoint of your choosing. Point it at LM Studio or Ollama and nothing leaves the machine. Point it at a cloud API and that text does. It is off until you turn it on.</li>
       <li><strong>No telemetry, no crash reporting, no accounts, no update pings.</strong> The site you are reading is the only server involved, and it only serves the download.</li>
     </ul>
