@@ -339,84 +339,51 @@ impl HarkStore {
         )?;
         let session_id = tx.last_insert_rowid();
 
-        // One mapping per distinct diarizer label, in first-seen order.
-        let people = speakers::load_people(&tx)?;
-        let mut speaker_ids: Vec<(String, i64)> = Vec::new();
-        for segment in &segments {
-            let label = &segment.speaker_label;
-            if speaker_ids.iter().any(|(seen, _)| seen == label) {
-                continue;
-            }
-            let profile = speakers.iter().find(|p| &p.label == label);
-            let verdict = profile
-                .map(|p| speakers::identify(&people, &p.voiceprint, p.talk_ms))
-                .unwrap_or(Verdict::Unknown);
-            let (matched, suggested, distance) = match verdict {
-                Verdict::Match { speaker_id, distance } => {
-                    (Some(speaker_id), Some(speaker_id), Some(distance as f64))
-                }
-                Verdict::Suggest { speaker_id, distance } => {
-                    (None, Some(speaker_id), Some(distance as f64))
-                }
-                Verdict::Unknown => (None, None, None),
-            };
-            let speaker_id = match matched {
-                Some(id) => id,
-                None => {
-                    tx.execute(
-                        "INSERT INTO speakers (display_name, named) VALUES (?1, 0)",
-                        [label],
-                    )?;
-                    tx.last_insert_rowid()
-                }
-            };
-            let voiceprint = profile
-                .and_then(|p| speakers::normalized(&p.voiceprint))
-                .map(|v| knowledge::embedding_to_blob(&v));
-            tx.execute(
-                "INSERT INTO session_speakers
-                     (session_id, speaker_id, label, voiceprint, talk_ms, mic_share,
-                      clip_start_ms, clip_end_ms, suggested_speaker_id, match_distance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                rusqlite::params![
-                    session_id,
-                    speaker_id,
-                    label,
-                    voiceprint,
-                    profile.map(|p| p.talk_ms),
-                    profile.map(|p| p.mic_share),
-                    profile.map(|p| p.clip_start_ms),
-                    profile.map(|p| p.clip_end_ms),
-                    suggested,
-                    distance
-                ],
-            )?;
-            speaker_ids.push((label.clone(), speaker_id));
-        }
-
-        for segment in &segments {
-            let speaker_id = speaker_ids
-                .iter()
-                .find(|(label, _)| label == &segment.speaker_label)
-                .map(|(_, id)| *id);
-            tx.execute(
-                "INSERT INTO segments
-                     (session_id, speaker_id, speaker_label, t_start_ms, t_end_ms, text, confidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    session_id,
-                    speaker_id,
-                    segment.speaker_label,
-                    segment.t_start_ms,
-                    segment.t_end_ms,
-                    segment.text,
-                    segment.confidence
-                ],
-            )?;
-        }
+        insert_meeting_content(&tx, session_id, &segments, &speakers)?;
 
         tx.commit()?;
         Ok(session_id)
+    }
+
+    /// Replaces a stored meeting's transcript and speakers with a fresh
+    /// processing of its recording, keeping the session itself (id, title,
+    /// project, times). For a recording that was transcribed badly and has
+    /// since been repaired. Names given to the old speakers are not carried
+    /// over: the new labels are matched by voice like any new meeting's.
+    pub fn replace_meeting_content(
+        &self,
+        session_id: i64,
+        segments: Vec<MeetingSegmentInput>,
+        speakers: Vec<MeetingSpeakerInput>,
+    ) -> Result<(), HarkError> {
+        let mut db = self.db.lock().expect("hark db lock poisoned");
+        check_writable(&db)?;
+        let tx = db.conn_mut().transaction()?;
+        let is_meeting: bool = tx
+            .query_row(
+                "SELECT kind = 'meeting' FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| HarkError::Failure(format!("meeting #{session_id} not found")))?;
+        if !is_meeting {
+            return Err(HarkError::Failure(format!("session #{session_id} is not a meeting")));
+        }
+        // Chunks point at segments, so they go first; the next index_pending
+        // rebuilds them.
+        speakers::invalidate_index(&tx, session_id)?;
+        tx.execute("DELETE FROM segments WHERE session_id = ?1", [session_id])?;
+        tx.execute("DELETE FROM session_speakers WHERE session_id = ?1", [session_id])?;
+        // Per-meeting placeholders nothing refers to any more. People stay.
+        tx.execute(
+            "DELETE FROM speakers WHERE named = 0
+               AND NOT EXISTS (SELECT 1 FROM session_speakers WHERE speaker_id = speakers.id)
+               AND NOT EXISTS (SELECT 1 FROM segments WHERE speaker_id = speakers.id)",
+            [],
+        )?;
+        insert_meeting_content(&tx, session_id, &segments, &speakers)?;
+        tx.commit()?;
+        Ok(())
     }
 
     // -- Speaker identity ----------------------------------------------------
@@ -1123,6 +1090,93 @@ impl HarkStore {
     }
 }
 
+/// Writes a meeting's label mappings and segments. A label whose voiceprint
+/// matches a known person is assigned to them (unconfirmed); the rest get a
+/// per-meeting placeholder speaker.
+fn insert_meeting_content(
+    tx: &rusqlite::Transaction,
+    session_id: i64,
+    segments: &[MeetingSegmentInput],
+    speakers: &[MeetingSpeakerInput],
+) -> Result<(), HarkError> {
+    // One mapping per distinct diarizer label, in first-seen order.
+    let people = speakers::load_people(tx)?;
+    let mut speaker_ids: Vec<(String, i64)> = Vec::new();
+    for segment in segments {
+        let label = &segment.speaker_label;
+        if speaker_ids.iter().any(|(seen, _)| seen == label) {
+            continue;
+        }
+        let profile = speakers.iter().find(|p| &p.label == label);
+        let verdict = profile
+            .map(|p| speakers::identify(&people, &p.voiceprint, p.talk_ms))
+            .unwrap_or(Verdict::Unknown);
+        let (matched, suggested, distance) = match verdict {
+            Verdict::Match { speaker_id, distance } => {
+                (Some(speaker_id), Some(speaker_id), Some(distance as f64))
+            }
+            Verdict::Suggest { speaker_id, distance } => {
+                (None, Some(speaker_id), Some(distance as f64))
+            }
+            Verdict::Unknown => (None, None, None),
+        };
+        let speaker_id = match matched {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT INTO speakers (display_name, named) VALUES (?1, 0)",
+                    [label],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        let voiceprint = profile
+            .and_then(|p| speakers::normalized(&p.voiceprint))
+            .map(|v| knowledge::embedding_to_blob(&v));
+        tx.execute(
+            "INSERT INTO session_speakers
+                 (session_id, speaker_id, label, voiceprint, talk_ms, mic_share,
+                  clip_start_ms, clip_end_ms, suggested_speaker_id, match_distance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                session_id,
+                speaker_id,
+                label,
+                voiceprint,
+                profile.map(|p| p.talk_ms),
+                profile.map(|p| p.mic_share),
+                profile.map(|p| p.clip_start_ms),
+                profile.map(|p| p.clip_end_ms),
+                suggested,
+                distance
+            ],
+        )?;
+        speaker_ids.push((label.clone(), speaker_id));
+    }
+
+    for segment in segments {
+        let speaker_id = speaker_ids
+            .iter()
+            .find(|(label, _)| label == &segment.speaker_label)
+            .map(|(_, id)| *id);
+        tx.execute(
+            "INSERT INTO segments
+                 (session_id, speaker_id, speaker_label, t_start_ms, t_end_ms, text, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                session_id,
+                speaker_id,
+                segment.speaker_label,
+                segment.t_start_ms,
+                segment.t_end_ms,
+                segment.text,
+                segment.confidence
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// Char-boundary-safe prefix truncation with an ellipsis when cut.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1436,6 +1490,53 @@ mod tests {
         let people = store.list_people().unwrap();
         assert_eq!(people.len(), 1, "names match case-insensitively");
         assert_eq!((people[0].meeting_count, people[0].voiceprint_count), (3, 1));
+    }
+
+    #[test]
+    fn replacing_a_meeting_keeps_the_session_and_rematches_voices() {
+        let store = temp_store("replace");
+        let first = meeting_with(&store, &[("SPEAKER_00", voice(0, 0.0), 60_000)]);
+        assign(&store, first, "SPEAKER_00", Some("Dana"));
+        // A badly processed meeting: Dana was not recognized in it.
+        let bad = meeting_with(&store, &[("SPEAKER_00", voice(8, 0.0), 60_000)]);
+        store.rename_session(bad, Some("Standup".into())).unwrap();
+        assert!(name_of(&store, bad, "SPEAKER_00").name.is_none());
+
+        store
+            .replace_meeting_content(
+                bad,
+                vec![MeetingSegmentInput {
+                    speaker_label: "SPEAKER_00".into(),
+                    t_start_ms: 0,
+                    t_end_ms: 9000,
+                    text: "second attempt".into(),
+                    confidence: None,
+                }],
+                vec![MeetingSpeakerInput {
+                    label: "SPEAKER_00".into(),
+                    voiceprint: voice(0, 0.2),
+                    talk_ms: 60_000,
+                    mic_share: 0.0,
+                    clip_start_ms: 0,
+                    clip_end_ms: 4000,
+                }],
+            )
+            .unwrap();
+
+        let meetings = store.recent_meetings(1).unwrap();
+        assert_eq!((meetings[0].id, meetings[0].title.as_deref()), (bad, Some("Standup")));
+        assert_eq!(meetings[0].segment_count, 1);
+        assert_eq!(store.meeting_transcript(bad).unwrap(), "[00:00] Dana: second attempt");
+        // Dana's own meeting is untouched, and no placeholder rows are left behind.
+        assert!(store.meeting_transcript(first).unwrap().contains("Dana: SPEAKER_00 speaking"));
+        let db = store.db.lock().unwrap();
+        let placeholders: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM speakers WHERE named = 0", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(placeholders, 0);
+        drop(db);
+        assert!(store.replace_meeting_content(999, vec![], vec![]).is_err());
     }
 
     #[test]
