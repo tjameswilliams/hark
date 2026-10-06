@@ -26,6 +26,8 @@ struct GeneralSettingsView: View {
         let stored = UserDefaults.standard.integer(forKey: "micIdleMinutes")
         return stored > 0 ? stored : 15
     }()
+    @State private var dumpCaptures: Bool =
+        UserDefaults.standard.bool(forKey: CaptureDump.defaultsKey)
 
     var body: some View {
         Form {
@@ -79,7 +81,28 @@ struct GeneralSettingsView: View {
                     }
                 }
             } footer: {
-                Text("Hark keeps the audio engine warm for instant capture. Pausing releases the microphone (and its indicator light) after a quiet stretch; the next press wakes it in about a quarter second.")
+                Text("Hark keeps the audio engine warm for instant capture. Pausing releases the microphone (and its indicator light) after a quiet stretch; the next press wakes it in about a quarter second. With Bluetooth headphones and this off, Hark still releases their microphone after \(DictationPipeline.bluetoothAwayMinutes) minutes without any keyboard or mouse activity, and takes it back on your next keystroke: holding it open keeps the headphones in call-quality mode for every other app, and their link needs a couple of seconds to carry audio after a wake-up.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Keep a copy of each dictation's audio", isOn: $dumpCaptures)
+                    .onChange(of: dumpCaptures) { _, newValue in
+                        UserDefaults.standard.set(newValue, forKey: CaptureDump.defaultsKey)
+                        harkLog("capture dumps \(newValue ? "enabled" : "disabled") (\(CaptureDump.directory.path)).")
+                    }
+                if dumpCaptures {
+                    Button("Show Captures in Finder") {
+                        try? FileManager.default.createDirectory(
+                            at: CaptureDump.directory, withIntermediateDirectories: true)
+                        NSWorkspace.shared.open(CaptureDump.directory)
+                    }
+                }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("For troubleshooting a dictation that comes back empty or wrong. Each capture is saved exactly as the speech model heard it, in Library/Application Support/Hark/captures; only the newest \(CaptureDump.keep) are kept. Leave this off normally.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

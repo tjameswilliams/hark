@@ -135,6 +135,33 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
     ",
+    // 4: cross-meeting speaker identity. A `speakers` row with named = 1 is
+    // a person the user has named; the rest are per-meeting placeholders
+    // ("SPEAKER_00"). Each meeting label keeps its own voiceprint (256-d
+    // f32 LE), talk time, the share of its energy that arrived on the mic
+    // channel, and the clip to play when asking who it is. A person's
+    // voiceprints are those on their confirmed labels. Segments remember
+    // their label so a label can be re-pointed at another speaker even after
+    // two labels were merged into one person. (speakers.voiceprint /
+    // embedding_dims from migration 1 stay unused.)
+    "
+    ALTER TABLE speakers ADD COLUMN named INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE session_speakers ADD COLUMN voiceprint BLOB;
+    ALTER TABLE session_speakers ADD COLUMN talk_ms INTEGER;
+    ALTER TABLE session_speakers ADD COLUMN mic_share REAL;
+    ALTER TABLE session_speakers ADD COLUMN clip_start_ms INTEGER;
+    ALTER TABLE session_speakers ADD COLUMN clip_end_ms INTEGER;
+    ALTER TABLE session_speakers ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE session_speakers ADD COLUMN suggested_speaker_id INTEGER
+        REFERENCES speakers(id) ON DELETE SET NULL;
+    ALTER TABLE session_speakers ADD COLUMN match_distance REAL;
+    CREATE INDEX idx_session_speakers_speaker ON session_speakers(speaker_id);
+    ALTER TABLE segments ADD COLUMN speaker_label TEXT;
+    UPDATE segments SET speaker_label = (
+        SELECT label FROM session_speakers ss
+        WHERE ss.session_id = segments.session_id AND ss.speaker_id = segments.speaker_id
+    );
+    ",
 ];
 
 pub struct Db {

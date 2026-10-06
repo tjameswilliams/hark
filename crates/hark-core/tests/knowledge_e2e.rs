@@ -91,6 +91,7 @@ fn index_and_semantic_search_end_to_end() {
                     confidence: Some(0.9),
                 },
             ],
+            vec![],
         )
         .unwrap();
 

@@ -11,6 +11,36 @@ enum AudioSpec {
     static var minimumSamples: Int { Int(sampleRate * 0.3) }
 }
 
+/// Peak and RMS of a finished capture in dBFS. Logged with every dictation
+/// and consulted by the pipeline's loud-but-empty guard; -120 dBFS stands in
+/// for digital silence so the numbers stay finite.
+struct CaptureLevel: Sendable {
+    let peakDB: Float
+    let rmsDB: Float
+
+    /// True when every sample is (effectively) zero — the TCC-denied /
+    /// dead-input signature, distinct from a quiet room.
+    var isDigitalSilence: Bool { peakDB <= -100 }
+
+    static func measure(_ samples: [Float]) -> CaptureLevel {
+        var peak: Float = 0
+        var sumSquares: Double = 0
+        for sample in samples {
+            peak = max(peak, abs(sample))
+            sumSquares += Double(sample) * Double(sample)
+        }
+        let rms = samples.isEmpty ? 0 : (sumSquares / Double(samples.count)).squareRoot()
+        func dB(_ linear: Double) -> Float {
+            linear > 0 ? Float(20 * log10(linear)) : -120
+        }
+        return CaptureLevel(peakDB: dB(Double(peak)), rmsDB: dB(rms))
+    }
+
+    var description: String {
+        String(format: "peak %.1f dBFS, RMS %.1f dBFS", peakDB, rmsDB)
+    }
+}
+
 enum MicCaptureError: Error, CustomStringConvertible {
     case noInputDevice
     case converterCreationFailed
@@ -130,6 +160,11 @@ final class MicCapture {
     var pinnedDeviceUID: String?
     /// Human-readable name of the device the IOProc actually bound to.
     private(set) var activeDeviceName = "system default"
+    /// True when the bound device is a Bluetooth (classic or LE) input. A
+    /// warm IOProc on such a device holds its hands-free link open, which
+    /// drops every other app's audio on the headset to call quality, so the
+    /// pipeline idle-parks these by default.
+    private(set) var activeDeviceIsBluetooth = false
 
     /// The bound device and its IOProc (nil while torn down).
     private var deviceID = AudioDeviceID(kAudioObjectUnknown)
@@ -172,12 +207,6 @@ final class MicCapture {
     /// (used when the pinned device died mid-session and we fall back to the
     /// system default).
     func warmUp(ignorePinned: Bool = false) throws -> Double {
-        let start = ContinuousClock.now
-
-        if isWarm { teardown() }
-        wantsWarm = true
-        installServiceRestartListener()
-
         // Resolve device: the pinned UID when present, else the system
         // default. Falls back to the default when the pinned device is
         // unplugged/missing.
@@ -194,6 +223,19 @@ final class MicCapture {
             }
             device = fallback
         }
+        return try warmUp(on: device)
+    }
+
+    /// Binds to `device` regardless of the pin/default preference. Used for
+    /// the wired fallback when a Bluetooth input keeps delivering zeros; the
+    /// preference itself is untouched, so the next ordinary warm-up (input
+    /// change, relaunch) goes back to it.
+    func warmUp(on device: AudioInputDevice) throws -> Double {
+        let start = ContinuousClock.now
+
+        if isWarm { teardown() }
+        wantsWarm = true
+        installServiceRestartListener()
 
         // Read the device's REAL input format from the HAL (nominal rate +
         // input-scope stream configuration) — not a graph node's idea of it.
@@ -245,6 +287,7 @@ final class MicCapture {
         deviceID = device.id
         procID = created
         activeDeviceName = device.name
+        activeDeviceIsBluetooth = AudioInputDevices.isBluetooth(device.id)
         boundSampleRate = sampleRate
         boundChannels = channels
         isWarm = true

@@ -244,7 +244,7 @@ final class MeetingController: MeetingFiler {
         Task { @MainActor in
             defer { self.processingCount -= 1 }
             do {
-                let utterances = try await MeetingProcessor.process(
+                let result = try await MeetingProcessor.process(
                     fileURL: url,
                     progress: { line in
                         harkLog("meeting: \(line)")
@@ -257,9 +257,11 @@ final class MeetingController: MeetingFiler {
                 session.phase = .processing(stage: "saving…")
                 if let id = self.persist(
                     title: title, startedAt: startedAtISO, endedAt: endedAtISO,
-                    audioPath: url.path, utterances: utterances) {
-                    session.speakerCount = Set(utterances.map(\.speakerLabel)).count
-                    session.segmentCount = utterances.count
+                    audioPath: url.path, result: result) {
+                    session.speakers = self.reviewSpeakers(sessionId: id)
+                    session.knownPeople = self.knownPeople()
+                    session.speakerCount = Set(result.utterances.map(\.speakerLabel)).count
+                    session.segmentCount = result.utterances.count
                     session.transcript = self.transcript(id: id) ?? ""
                     session.phase = .ready(sessionId: id)
                 } else {
@@ -287,13 +289,13 @@ final class MeetingController: MeetingFiler {
     /// unavailable or the insert fails.
     private func persist(
         title: String, startedAt: String, endedAt: String,
-        audioPath: String, utterances: [MeetingUtterance]
+        audioPath: String, result: MeetingProcessingResult
     ) -> Int64? {
         guard let store = storeProvider() else {
             harkLog("meeting: store unavailable — transcript not persisted; recording kept at \(audioPath)")
             return nil
         }
-        let segments = utterances.map {
+        let segments = result.utterances.map {
             MeetingSegmentInput(
                 speakerLabel: $0.speakerLabel,
                 tStartMs: $0.tStartMs,
@@ -301,13 +303,23 @@ final class MeetingController: MeetingFiler {
                 text: $0.text,
                 confidence: $0.confidence)
         }
+        let speakers = result.speakers.map {
+            MeetingSpeakerInput(
+                label: $0.label,
+                voiceprint: $0.voiceprint,
+                talkMs: $0.talkMs,
+                micShare: $0.micShare,
+                clipStartMs: $0.clipStartMs,
+                clipEndMs: $0.clipEndMs)
+        }
         do {
             let id = try store.recordMeeting(
                 title: title,
                 startedAt: startedAt,
                 endedAt: endedAt,
                 audioPath: audioPath,
-                segments: segments)
+                segments: segments,
+                speakers: speakers)
             harkLog("meeting: #\(id) stored (\(segments.count) segment(s)).")
             onMeetingStored?()
             return id
@@ -315,6 +327,32 @@ final class MeetingController: MeetingFiler {
             harkLog("meeting: WARNING — failed to store the transcript (\(error)); recording kept at \(audioPath)")
             return nil
         }
+    }
+
+    // MARK: - Speakers
+
+    /// The meeting's voices as the review window shows them: who Hark
+    /// recognized, who it only suspects, and who is new.
+    private func reviewSpeakers(sessionId: Int64) -> [ReviewSpeaker] {
+        guard let store = storeProvider() else { return [] }
+        do {
+            return try store.meetingSpeakers(sessionId: sessionId).map { record in
+                if let name = record.name, let distance = record.matchDistance {
+                    harkLog(String(
+                        format: "meeting: #%lld %@ recognized as %@ (voice distance %.2f).",
+                        sessionId, record.label, name, distance))
+                }
+                return ReviewSpeaker(record)
+            }
+        } catch {
+            harkLog("meeting review: WARNING — could not read the speakers of meeting #\(sessionId): \(error)")
+            return []
+        }
+    }
+
+    private func knownPeople() -> [String] {
+        guard let store = storeProvider() else { return [] }
+        return ((try? store.listPeople()) ?? []).map(\.name)
     }
 
     // MARK: - MeetingFiler
@@ -342,6 +380,22 @@ final class MeetingController: MeetingFiler {
             projectName = newProjectName
         } else if let projectId {
             projectName = projectChoices().first(where: { $0.id == projectId })?.name
+        }
+
+        // Names first: they change who said what, and so the index built by
+        // the re-index below. Every row counts as reviewed — a name the user
+        // left in place is a confirmation, and teaches that person's voice.
+        let assignments = session.speakers.map { speaker in
+            let name = speaker.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return SpeakerAssignment(label: speaker.label, name: name.isEmpty ? nil : name)
+        }
+        if !assignments.isEmpty {
+            try store.setMeetingSpeakers(sessionId: sessionId, assignments: assignments)
+            session.transcript = transcript(id: sessionId) ?? session.transcript
+            let named = assignments.compactMap(\.name)
+            if !named.isEmpty {
+                harkLog("meeting: #\(sessionId) speakers named: \(named.joined(separator: ", ")).")
+            }
         }
 
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)

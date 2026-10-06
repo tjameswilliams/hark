@@ -3,6 +3,7 @@ import ApplicationServices
 import AVFoundation
 import CoreGraphics
 import Foundation
+import IOKit
 
 /// User-visible pipeline state, mirrored into the status menu.
 enum PipelineState: Equatable {
@@ -123,10 +124,49 @@ final class DictationPipeline: NSObject {
     private var modelsReady = false
     private var startupFailure: String?
 
+    /// Loud-but-empty guard. A resident CoreML model can start returning
+    /// blank text for perfectly good audio (seen after a Teams call on
+    /// 2026-09-09: coreaudiod delivered voice-level audio, the model said
+    /// nothing, and only a relaunch fixed it). Two consecutive empties on
+    /// audio peaking above `loudPeakDB` reload the Transcriber in place.
+    private var loudEmptyStreak = 0
+    private var lastTranscriberReload: ContinuousClock.Instant?
+
+    /// Silent-capture recovery. A Bluetooth headset's hands-free mic link
+    /// can come back from sleep delivering zeros system-wide (coreaudiod
+    /// rejects every packet; seen 2026-09-09 after a long sleep). Tearing
+    /// the IOProc down and re-creating it within milliseconds keeps the link
+    /// alive, so nothing changes; the link has to be *dropped* for a few
+    /// seconds to renegotiate. First silent capture on Bluetooth: drop it
+    /// and re-warm after `linkResetDelay`. Second in a row: bind a wired
+    /// input instead until the next input change or relaunch.
+    private var silentCaptureStreak = 0
+    private var micRestartTask: Task<Void, Never>?
+    private var wakeObserver: NSObjectProtocol?
+    private static let linkResetDelay: Duration = .seconds(3)
+    private static let loudPeakDB: Float = -20
+    private static let reloadCooldown: Duration = .seconds(60)
+
     /// Idle mic parking (UserDefaults "micIdleMinutes"; 0 = never park).
     /// When the timer expires the warm engine is torn down; the next press
     /// warms it back up inline (~250 ms) before capturing.
     private var micIdleMinutes = 0
+    /// Away-parking for Bluetooth inputs. A warm IOProc holds the headset's
+    /// hands-free link open, which pins every other app's audio on it to
+    /// call quality and blocks idle sleep — but that link also takes ~2 s
+    /// to carry audio after a wake-up, so parking on *dictation* gaps lost
+    /// the first hold after every pause (2026-09-09). Instead the mic parks
+    /// only once there has been no keyboard or mouse input for
+    /// `bluetoothAwayMinutes`, and is woken again on the first input, which
+    /// in practice lands well before the next press.
+    static let bluetoothAwayMinutes = 5
+    private var awayTimer: Timer?
+    private var parkedForAway = false
+    /// When a Bluetooth mic was last (re)warmed: captures that start inside
+    /// `bluetoothSettleTime` of it can predate the link and come back near
+    /// silent; the log says so instead of just "empty transcript".
+    private var bluetoothWarmAt: ContinuousClock.Instant?
+    private static let bluetoothSettleTime: Duration = .seconds(3)
     private var micParked = false {
         didSet { if micParked != oldValue { onStateChange?(state) } }
     }
@@ -175,6 +215,13 @@ final class DictationPipeline: NSObject {
         mic.pinnedDeviceUID = UserDefaults.standard.string(forKey: "inputDeviceUID")
         pttKey = PTTKey.forKeycode(Int64(UserDefaults.standard.integer(forKey: "pttKeycode")))
         micIdleMinutes = UserDefaults.standard.integer(forKey: "micIdleMinutes")
+        // After sleep the warm IOProc survives but its device (Bluetooth
+        // especially) may not deliver real audio again until rebound.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.systemDidWake() }
+        }
 
         // Accessibility (TCC) check, with the system prompt on first launch.
         // Note: the literal key equals kAXTrustedCheckOptionPrompt; the
@@ -389,16 +436,22 @@ final class DictationPipeline: NSObject {
             UserDefaults.standard.removeObject(forKey: "inputDeviceUID")
         }
         mic.pinnedDeviceUID = uid
+        silentCaptureStreak = 0
+        micRestartTask?.cancel()
+        micRestartTask = nil
         guard mic.isWarm else { return }
         mic.teardown()
         do {
             let ms = try mic.warmUp()
+            bluetoothWarmAt = mic.activeDeviceIsBluetooth ? ContinuousClock.now : nil
             harkLog(String(
                 format: "input device changed — engine rebound in %.0f ms (%@).",
                 ms, mic.inputDescription))
         } catch {
             harkLog("FAILED to restart the audio engine on the new input device: \(error)")
         }
+        // The new device may or may not be Bluetooth: re-evaluate idle parking.
+        scheduleIdleTimer()
         refreshState()
     }
 
@@ -511,16 +564,19 @@ final class DictationPipeline: NSObject {
     private func scheduleIdleTimer() {
         idleTimer?.invalidate()
         idleTimer = nil
-        guard micIdleMinutes > 0, !micParked else { return }
+        scheduleAwayTimer()
+        let minutes = micIdleMinutes
+        guard minutes > 0, !micParked else { return }
         // Target/selector, not the block API (same Swift 6 pattern as the
         // Accessibility retry timer): fires on the main runloop.
         idleTimer = Timer.scheduledTimer(
-            timeInterval: Double(micIdleMinutes) * 60, target: self,
+            timeInterval: Double(minutes) * 60, target: self,
             selector: #selector(idleTimerFired), userInfo: nil, repeats: false)
     }
 
     @objc private func idleTimerFired() {
-        guard micIdleMinutes > 0, !micParked, mic.isWarm else { return }
+        let minutes = micIdleMinutes
+        guard minutes > 0, !micParked, mic.isWarm else { return }
         guard !capturing, !busy else {
             // Mid-dictation expiry: not idle after all — rearm.
             scheduleIdleTimer()
@@ -528,7 +584,72 @@ final class DictationPipeline: NSObject {
         }
         mic.teardown()
         micParked = true
-        harkLog("mic paused after \(micIdleMinutes) min idle — press \(pttKey.symbol) to wake it.")
+        harkLog("mic paused after \(minutes) min idle — press \(pttKey.symbol) to wake it.")
+    }
+
+    // MARK: - Away parking (Bluetooth)
+
+    /// Seconds since the last keyboard/mouse/trackpad event, from IOKit's
+    /// HIDIdleTime; nil when the registry query fails.
+    private static func secondsSinceLastInput() -> Double? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let raw = IORegistryEntryCreateCFProperty(
+            service, "HIDIdleTime" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue(),
+              let nanoseconds = (raw as? NSNumber)?.doubleValue
+        else { return nil }
+        return nanoseconds / 1e9
+    }
+
+    /// Runs whenever the mic's binding may have changed. Warm on Bluetooth:
+    /// poll for absence every 15 s. Parked for absence: poll for return
+    /// every second. Otherwise no timer.
+    private func scheduleAwayTimer() {
+        awayTimer?.invalidate()
+        awayTimer = nil
+        let interval: TimeInterval
+        if parkedForAway {
+            interval = 1
+        } else if mic.isWarm, mic.activeDeviceIsBluetooth, micIdleMinutes == 0 {
+            interval = 15
+        } else {
+            return
+        }
+        awayTimer = Timer.scheduledTimer(
+            timeInterval: interval, target: self,
+            selector: #selector(awayTimerFired), userInfo: nil, repeats: true)
+    }
+
+    @objc private func awayTimerFired() {
+        guard let idle = Self.secondsSinceLastInput() else { return }
+        if parkedForAway {
+            // First input since parking: warm the mic now so the hands-free
+            // link is up before the next press.
+            guard idle < 2 else { return }
+            parkedForAway = false
+            micParked = false
+            do {
+                let ms = try mic.warmUp()
+                bluetoothWarmAt = mic.activeDeviceIsBluetooth ? ContinuousClock.now : nil
+                harkLog(String(format: "activity resumed — mic woken ahead of the next dictation in %.0f ms.", ms))
+            } catch {
+                harkLog("mic wake after activity FAILED: \(error) — the next press will retry.")
+                micParked = true  // press path retries via wakeParkedMic()
+            }
+            scheduleAwayTimer()
+            refreshState()
+            return
+        }
+        guard idle >= Double(Self.bluetoothAwayMinutes * 60),
+              mic.isWarm, !micParked, !capturing, !busy, micRestartTask == nil
+        else { return }
+        mic.teardown()
+        micParked = true
+        parkedForAway = true
+        harkLog("no keyboard or mouse input for \(Self.bluetoothAwayMinutes) min — released the Bluetooth mic's hands-free link; it wakes on your next keystroke or click.")
+        scheduleAwayTimer()
+        refreshState()
     }
 
     /// Warms the parked engine back up inline (~250 ms — the press handler is
@@ -538,7 +659,13 @@ final class DictationPipeline: NSObject {
         do {
             let ms = try mic.warmUp()
             micParked = false
-            harkLog(String(format: "mic woken from idle pause in %.0f ms.", ms))
+            parkedForAway = false
+            bluetoothWarmAt = mic.activeDeviceIsBluetooth ? ContinuousClock.now : nil
+            if mic.activeDeviceIsBluetooth {
+                harkLog(String(format: "mic woken from idle pause in %.0f ms — its hands-free link needs a couple of seconds more before it carries audio.", ms))
+            } else {
+                harkLog(String(format: "mic woken from idle pause in %.0f ms.", ms))
+            }
             return true
         } catch {
             harkLog("FAILED to wake the paused mic: \(error) — press ignored. It will be retried on the next press.")
@@ -601,6 +728,10 @@ final class DictationPipeline: NSObject {
             harkLog("still processing the previous dictation — press ignored.")
             return
         }
+        guard micRestartTask == nil else {
+            harkLog("audio engine is restarting — press ignored, try again in a moment.")
+            return
+        }
         if micParked {
             // Idle-parked engine: warm it back up inline before capturing.
             guard wakeParkedMic() else { return }
@@ -653,9 +784,17 @@ final class DictationPipeline: NSObject {
 
         let samples = capture.samples
         let captureSeconds = Double(samples.count) / AudioSpec.sampleRate
+        let level = CaptureLevel.measure(samples)
         harkLog(String(
-            format: "held %.0f ms — captured %.2f s of audio (%d samples).",
-            held.millisecondsValue, captureSeconds, samples.count))
+            format: "held %.0f ms — captured %.2f s of audio (%d samples), %@.",
+            held.millisecondsValue, captureSeconds, samples.count, level.description))
+        if CaptureDump.isEnabled, let url = CaptureDump.write(samples, capturedAt: startedDate) {
+            harkLog("capture dump: \(url.path)")
+        }
+        if let warmAt = bluetoothWarmAt, warmAt.duration(to: pressedAt) < Self.bluetoothSettleTime,
+           level.peakDB < -20 {
+            harkLog("that hold started \(Int(warmAt.duration(to: pressedAt).millisecondsValue)) ms after the Bluetooth mic woke, before its hands-free link carried audio — please say it again.")
+        }
 
         guard samples.count >= AudioSpec.minimumSamples else {
             harkLog("""
@@ -670,23 +809,13 @@ final class DictationPipeline: NSObject {
         }
 
         // All-silence guard: TCC-denied input often delivers buffers of zeros.
-        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
-        guard peak > 1e-5 else {
+        guard !level.isDigitalSilence else {
             if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
                 // Permission IS granted, so this engine was almost certainly
                 // started before the grant landed — a pre-grant AVAudioEngine
                 // delivers zeros forever. Restart it; the next hold hears.
-                harkLog("""
-                    captured audio is pure silence but the mic permission is
-                    granted — restarting the audio engine (it was likely
-                    started before the grant). Try dictating again.
-                    """)
-                mic.teardown()
-                if let ms = try? mic.warmUp() {
-                    harkLog(String(format: "audio engine restarted, warm in %.0f ms.", ms))
-                } else {
-                    harkLog("audio engine restart FAILED — try quitting and reopening Hark.")
-                }
+                silentCaptureStreak += 1
+                recoverFromSilentCapture()
             } else {
                 harkLog("""
                     captured audio is pure silence (peak amplitude ~0) — not
@@ -699,6 +828,8 @@ final class DictationPipeline: NSObject {
             refreshState()
             return
         }
+
+        silentCaptureStreak = 0
 
         guard let transcriber else {
             indicator.hide()
@@ -717,7 +848,9 @@ final class DictationPipeline: NSObject {
                 var rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if rawText.isEmpty {
                     harkLog("empty transcript — nothing to paste.")
+                    await noteEmptyTranscript(level: level)
                 } else {
+                    loudEmptyStreak = 0
                     harkLog("transcript: \"\(rawText)\"")
                     // Deterministic dictionary replacements on the raw
                     // transcript BEFORE cleanup (the LLM sees corrected
@@ -775,6 +908,114 @@ final class DictationPipeline: NSObject {
         }
     }
 
+    // MARK: - Silent-capture recovery
+
+    private func recoverFromSilentCapture() {
+        let bluetooth = mic.activeDeviceIsBluetooth
+        let name = mic.activeDeviceName
+        guard bluetooth else {
+            // Wired input delivering zeros: the classic pre-grant engine.
+            // A plain restart fixes that.
+            harkLog("""
+                captured audio is pure silence but the mic permission is
+                granted — restarting the audio engine (it was likely
+                started before the grant). Try dictating again.
+                """)
+            mic.teardown()
+            if let ms = try? mic.warmUp() {
+                harkLog(String(format: "audio engine restarted, warm in %.0f ms.", ms))
+            } else {
+                harkLog("audio engine restart FAILED — try quitting and reopening Hark.")
+            }
+            return
+        }
+        if silentCaptureStreak >= 2, let wired = AudioInputDevices.wiredFallback(), wired.name != name {
+            harkLog("'\(name)' is still delivering pure silence after a link reset — falling back to '\(wired.name)' until you change the input or relaunch.")
+            mic.teardown()
+            do {
+                let ms = try mic.warmUp(on: wired)
+                harkLog(String(format: "mic engine warm on fallback in %.0f ms (%@).", ms, mic.inputDescription))
+            } catch {
+                harkLog("fallback to '\(wired.name)' FAILED: \(error) — try quitting and reopening Hark.")
+            }
+            scheduleIdleTimer()
+            return
+        }
+        restartMic(
+            reason: "captured audio is pure silence from Bluetooth input '\(name)' — dropping its hands-free link so it renegotiates")
+    }
+
+    /// Tears the engine down now and warms it again after `linkResetDelay`.
+    /// Presses in between are refused (see pressed()).
+    private func restartMic(reason: String) {
+        harkLog("\(reason); re-warming in \(Int(Self.linkResetDelay.secondsValue)) s.")
+        micRestartTask?.cancel()
+        mic.teardown()
+        idleTimer?.invalidate()
+        idleTimer = nil
+        micRestartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.linkResetDelay)
+            guard let self, !Task.isCancelled else { return }
+            self.micRestartTask = nil
+            do {
+                let ms = try self.mic.warmUp()
+                self.bluetoothWarmAt = self.mic.activeDeviceIsBluetooth ? ContinuousClock.now : nil
+                harkLog(String(format: "audio engine restarted, warm in %.0f ms (%@) — try dictating again.", ms, self.mic.inputDescription))
+            } catch {
+                harkLog("audio engine restart FAILED: \(error) — try quitting and reopening Hark.")
+            }
+            self.scheduleIdleTimer()
+            self.refreshState()
+        }
+    }
+
+    private func systemDidWake() {
+        // A parked or cold mic warms up fresh on the next press anyway.
+        guard mic.isWarm, !micParked, !capturing, !busy else { return }
+        silentCaptureStreak = 0
+        restartMic(reason: "system woke — restarting the audio engine on '\(mic.activeDeviceName)'")
+    }
+
+    // MARK: - Loud-but-empty guard
+
+    /// Called on every empty transcript. Quiet captures (the user held the
+    /// key without speaking) are ignored; two consecutive empties on loud
+    /// audio mean the model, not the mic, and the Transcriber is rebuilt
+    /// from the cached CoreML files. Runs inside the dictation task, so
+    /// `busy` already blocks presses until the swap is done.
+    private func noteEmptyTranscript(level: CaptureLevel) async {
+        guard level.peakDB > Self.loudPeakDB else {
+            loudEmptyStreak = 0
+            return
+        }
+        loudEmptyStreak += 1
+        guard loudEmptyStreak >= 2 else { return }
+        if let last = lastTranscriberReload,
+           last.duration(to: ContinuousClock.now) < Self.reloadCooldown {
+            harkLog("speech model still returning nothing for loud audio (reloaded <60 s ago) — try quitting and reopening Hark.")
+            return
+        }
+        harkLog(String(
+            format: "%d consecutive empty transcripts on loud audio (peak %.1f dBFS) — reloading the speech model.",
+            loudEmptyStreak, level.peakDB))
+        let start = ContinuousClock.now
+        do {
+            let fresh = try await Transcriber.load()
+            transcriber = fresh
+            lastTranscriberReload = ContinuousClock.now
+            loudEmptyStreak = 0
+            harkLog(String(
+                format: "speech model reloaded in %.2f s — try dictating again.",
+                (ContinuousClock.now - start).secondsValue))
+            let snapshot = dictionaryEntries
+            if !snapshot.filter(\.enabled).isEmpty {
+                Task { await fresh.setVocabulary(snapshot) }
+            }
+        } catch {
+            harkLog("speech model reload FAILED: \(error) — quit and reopen Hark.")
+        }
+    }
+
     // MARK: - Persistence
 
     private func persist(
@@ -813,10 +1054,18 @@ final class DictationPipeline: NSObject {
     func teardown() {
         indicator.hide()
         dictationTask?.cancel()
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
         axRetryTimer?.invalidate()
         axRetryTimer = nil
         idleTimer?.invalidate()
         idleTimer = nil
+        awayTimer?.invalidate()
+        awayTimer = nil
         mic.teardown()
         if let tapPort {
             CGEvent.tapEnable(tap: tapPort, enable: false)

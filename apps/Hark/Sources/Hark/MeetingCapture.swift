@@ -166,6 +166,8 @@ final class MeetingCapture {
         }
         aggregateID = newAggregateID
 
+        // Only a starting guess: the IO side measures the rate audio really
+        // arrives at and converts from that (see InputRateMeter).
         let aggregateRate = Self.nominalSampleRate(of: aggregateID)
         let inputRate = aggregateRate > 0 ? aggregateRate : 48_000
         harkLog("meeting: aggregate device up, nominal rate \(Int(inputRate)) Hz")
@@ -185,7 +187,7 @@ final class MeetingCapture {
         let io: MeetingCaptureIO
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            io = try MeetingCaptureIO(fileURL: url, inputSampleRate: inputRate)
+            io = try MeetingCaptureIO(fileURL: url, nominalSampleRate: inputRate)
         } catch let error as MeetingCaptureError {
             destroyCoreAudioObjects()
             throw error
@@ -384,8 +386,15 @@ final class MeetingCapture {
     /// Built outside any actor context so no isolation is inferred (the HAL
     /// invokes it on `ioQueue`).
     private nonisolated static func makeIOBlock(io: MeetingCaptureIO) -> AudioDeviceIOBlock {
-        { _, inInputData, _, _, _ in
-            io.handleInput(inInputData)
+        { inNow, inInputData, inInputTime, _, _ in
+            // The buffer's own hardware timestamp when there is one; "now"
+            // is later by a jittery amount, but still good enough to tell
+            // 24 kHz from 48 kHz over a second.
+            let stamp = inInputTime.pointee.mFlags.contains(.hostTimeValid)
+                ? inInputTime.pointee.mHostTime
+                : (inNow.pointee.mFlags.contains(.hostTimeValid)
+                    ? inNow.pointee.mHostTime : mach_absolute_time())
+            io.handleInput(inInputData, hostTime: stamp)
         }
     }
 
@@ -446,12 +455,67 @@ final class MeetingCapture {
 
 // MARK: - IO-side state
 
-/// One side (mic or system) of the capture: downmixes the HAL Float32 buffer
-/// to mono at the aggregate rate, streams it through an AVAudioConverter to
-/// 16 kHz, and accumulates the converted samples in a FIFO until the writer
-/// pairs both sides frame-for-frame. Only ever touched from the serial IO
-/// queue (and from stop() after ioQueue.sync{} drained it), hence
-/// @unchecked Sendable — same pattern as MicCapture's ConverterBox.
+/// Measures the rate audio actually arrives at, from how many frames the
+/// HAL delivers between buffer timestamps, and snaps it to a standard rate.
+///
+/// The aggregate's nominal rate cannot be trusted. With a Bluetooth headset
+/// as the output device it reads 48 kHz while music-quality playback is up,
+/// but the moment the headset's microphone opens the link drops to its
+/// hands-free rate and buffers arrive at 24 kHz. Converting those as 48 kHz
+/// wrote recordings at half length: double speed, an octave up (seen on
+/// three real meetings, 2026-10-05/06).
+struct InputRateMeter {
+    static let standardRates: [Double] = [
+        8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000,
+    ]
+
+    /// Seconds of audio per measurement.
+    var window: Double
+    private var windowStart: Double?
+    private var frames = 0
+
+    init(window: Double) { self.window = window }
+
+    /// Records a buffer of `count` frames stamped `time` (seconds, any
+    /// monotonic origin). Returns the snapped rate each time a window closes.
+    mutating func add(frames count: Int, at time: Double) -> Double? {
+        guard let start = windowStart else {
+            windowStart = time
+            frames = count
+            return nil
+        }
+        // A buffer's stamp is its first frame, so the frames counted so far
+        // span exactly start..<time.
+        guard time - start >= window else {
+            frames += count
+            return nil
+        }
+        let measured = Double(frames) / (time - start)
+        windowStart = time
+        frames = count
+        return Self.snap(measured)
+    }
+
+    /// What has been seen of an unfinished window, if it is enough to trust
+    /// (a recording stopped before the first window closed).
+    func partial(until time: Double) -> Double? {
+        guard let start = windowStart, time - start >= 0.25, frames > 0 else { return nil }
+        return Self.snap(Double(frames) / (time - start))
+    }
+
+    /// The standard rate nearest `measured` on a ratio scale.
+    static func snap(_ measured: Double) -> Double? {
+        guard measured.isFinite, measured > 0 else { return nil }
+        return standardRates.min { abs(log($0 / measured)) < abs(log($1 / measured)) }
+    }
+}
+
+/// One side (mic or system) of the capture: streams mono Float32 at the
+/// device rate through an AVAudioConverter to 16 kHz and accumulates the
+/// converted samples in a FIFO until the writer pairs both sides
+/// frame-for-frame. Only ever touched from the serial IO queue (and from
+/// stop() after ioQueue.sync{} drained it), hence @unchecked Sendable — same
+/// pattern as MicCapture's ConverterBox.
 private final class ChannelPipe: @unchecked Sendable {
     private let converter: AVAudioConverter
     private let inputFormat: AVAudioFormat
@@ -460,7 +524,6 @@ private final class ChannelPipe: @unchecked Sendable {
     private var pending: AVAudioPCMBuffer?
     /// Converted 16 kHz mono samples awaiting interleave.
     var fifo: [Float] = []
-    private(set) var peak: Float = 0
 
     init(inputSampleRate: Double) throws {
         guard
@@ -480,21 +543,18 @@ private final class ChannelPipe: @unchecked Sendable {
     }
 
     /// Downmixes `frames` frames of interleaved Float32 (`channels` wide) to
-    /// mono, tracks the peak, converts to 16 kHz, and appends to the FIFO.
-    /// Returns this buffer's own peak (the silence monitor's raw signal).
-    @discardableResult
-    func feed(_ data: UnsafePointer<Float32>, frames: Int, channels: Int) -> Float {
-        guard frames > 0, channels > 0,
-              let mono = AVAudioPCMBuffer(
-                pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(frames)),
-              let dst = mono.floatChannelData?[0]
-        else { return 0 }
-
-        var bufferPeak: Float = 0
+    /// mono. Returns the samples and their peak (the silence monitor's raw
+    /// signal).
+    static func downmix(
+        _ data: UnsafePointer<Float32>, frames: Int, channels: Int
+    ) -> (samples: [Float], peak: Float) {
+        guard frames > 0, channels > 0 else { return ([], 0) }
+        var peak: Float = 0
+        var mono = [Float](repeating: 0, count: frames)
         if channels == 1 {
             for i in 0..<frames {
-                dst[i] = data[i]
-                bufferPeak = max(bufferPeak, abs(data[i]))
+                mono[i] = data[i]
+                peak = max(peak, abs(data[i]))
             }
         } else {
             let scale = 1 / Float(channels)
@@ -502,11 +562,23 @@ private final class ChannelPipe: @unchecked Sendable {
                 var sum: Float = 0
                 for ch in 0..<channels { sum += data[frame * channels + ch] }
                 let v = sum * scale
-                dst[frame] = v
-                bufferPeak = max(bufferPeak, abs(v))
+                mono[frame] = v
+                peak = max(peak, abs(v))
             }
         }
-        peak = max(peak, bufferPeak)
+        return (mono, peak)
+    }
+
+    /// Converts mono samples at the device rate to 16 kHz and appends them
+    /// to the FIFO.
+    func feed(_ samples: [Float]) {
+        let frames = samples.count
+        guard frames > 0,
+              let mono = AVAudioPCMBuffer(
+                pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(frames)),
+              let dst = mono.floatChannelData?[0]
+        else { return }
+        samples.withUnsafeBufferPointer { dst.update(from: $0.baseAddress!, count: frames) }
         mono.frameLength = AVAudioFrameCount(frames)
 
         // Streaming conversion: feed exactly this buffer, then report
@@ -514,7 +586,7 @@ private final class ChannelPipe: @unchecked Sendable {
         let ratio = outputFormat.sampleRate / inputFormat.sampleRate
         let capacity = AVAudioFrameCount((Double(frames) * ratio).rounded(.up)) + 64
         guard let out = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            return bufferPeak
+            return
         }
         pending = mono
         var convError: NSError?
@@ -528,14 +600,13 @@ private final class ChannelPipe: @unchecked Sendable {
             return next
         }
         guard status != .error, out.frameLength > 0, let channel = out.floatChannelData else {
-            return bufferPeak
+            return
         }
         fifo.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: Int(out.frameLength)))
-        return bufferPeak
     }
 
-    /// Pads the FIFO with silence up to `count` samples (used for the mic
-    /// side when the aggregate exposes only the tap buffer).
+    /// Pads the FIFO with silence up to `count` samples (evens out the two
+    /// sides at the end of a recording).
     func padZeros(to count: Int) {
         if fifo.count < count {
             fifo.append(contentsOf: repeatElement(0, count: count - fifo.count))
@@ -548,10 +619,35 @@ private final class ChannelPipe: @unchecked Sendable {
 /// stop() drains that queue (ioQueue.sync{}) before finish() reads state from
 /// the main actor — so no lock is needed (@unchecked Sendable is safe, same
 /// discipline as the spike's Recorder).
-private final class MeetingCaptureIO: @unchecked Sendable {
-    private let micPipe: ChannelPipe
-    private let sysPipe: ChannelPipe
+final class MeetingCaptureIO: @unchecked Sendable {
+    /// Nil until the input rate has been measured; audio is held meanwhile.
+    private var pipes: (mic: ChannelPipe, sys: ChannelPipe)?
+    /// The rate `pipes` convert from.
+    private(set) var inputRate: Double = 0
+    private let nominalRate: Double
+    private var meter = InputRateMeter(window: MeetingCaptureIO.calibrationSeconds)
+    /// Device-rate mono audio captured before the rate was known.
+    private var heldMic: [Float] = []
+    private var heldSys: [Float] = []
+    /// A measured rate that disagrees with `inputRate`, awaiting a second
+    /// window to confirm it before the converters are rebuilt.
+    private var disputedRate: Double?
+    private var lastHostSeconds: Double = 0
+    private var micPeak: Float = 0
+    private var sysPeak: Float = 0
     private let writer: WavStreamWriter
+
+    /// Audio held while the first measurement runs, then how often the rate
+    /// is re-checked for the rest of the recording.
+    private static let calibrationSeconds = 1.0
+    /// Held audio (at the nominal rate) after which calibration is abandoned.
+    private static let calibrationGiveUpSeconds = 4.0
+    private static let monitorSeconds = 5.0
+    private static let secondsPerHostTick: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom) / 1e9
+    }()
     private var loggedLayout = false
     private var callbackCount = 0
     private var framesWritten = 0
@@ -573,16 +669,15 @@ private final class MeetingCaptureIO: @unchecked Sendable {
         return t > 0 ? Date(timeIntervalSinceReferenceDate: t) : nil
     }
 
-    init(fileURL: URL, inputSampleRate: Double) throws {
-        micPipe = try ChannelPipe(inputSampleRate: inputSampleRate)
-        sysPipe = try ChannelPipe(inputSampleRate: inputSampleRate)
+    init(fileURL: URL, nominalSampleRate: Double) throws {
+        nominalRate = nominalSampleRate
         writer = try WavStreamWriter(
             url: fileURL,
             channels: MeetingCapture.outputChannels,
             sampleRate: Int(MeetingCapture.outputSampleRate))
     }
 
-    func handleInput(_ inInputData: UnsafePointer<AudioBufferList>) {
+    func handleInput(_ inInputData: UnsafePointer<AudioBufferList>, hostTime: UInt64) {
         let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
         let bufferCount = abl.count
         guard bufferCount > 0 else { return }
@@ -605,38 +700,112 @@ private final class MeetingCaptureIO: @unchecked Sendable {
         let sysBuffer = abl[bufferCount - 1]
         let bytesPerFloat = MemoryLayout<Float32>.size
 
-        var micPeak: Float = 0
-        var sysPeak: Float = 0
+        var mic: (samples: [Float], peak: Float) = ([], 0)
+        var sys: (samples: [Float], peak: Float) = ([], 0)
         if let micBuffer,
            micBuffer.mNumberChannels > 0,
            let data = micBuffer.mData?.assumingMemoryBound(to: Float32.self) {
             let channels = Int(micBuffer.mNumberChannels)
             let frames = Int(micBuffer.mDataByteSize) / (bytesPerFloat * channels)
-            micPeak = micPipe.feed(data, frames: frames, channels: channels)
+            mic = ChannelPipe.downmix(data, frames: frames, channels: channels)
         }
         if sysBuffer.mNumberChannels > 0,
            let data = sysBuffer.mData?.assumingMemoryBound(to: Float32.self) {
             let channels = Int(sysBuffer.mNumberChannels)
             let frames = Int(sysBuffer.mDataByteSize) / (bytesPerFloat * channels)
-            sysPeak = sysPipe.feed(data, frames: frames, channels: channels)
-        }
-        if micPeak > Self.micActivityThreshold || sysPeak > Self.systemActivityThreshold {
-            let now = Date().timeIntervalSinceReferenceDate
-            lastActivity.withLock { $0 = now }
+            sys = ChannelPipe.downmix(data, frames: frames, channels: channels)
         }
         if micBuffer == nil {
             // Single-buffer degenerate case: keep the channels paired by
-            // padding the mic side with silence.
-            micPipe.padZeros(to: sysPipe.fifo.count)
+            // giving the mic side silence of the same length.
+            mic = ([Float](repeating: 0, count: sys.samples.count), 0)
+        }
+        micPeak = max(micPeak, mic.peak)
+        sysPeak = max(sysPeak, sys.peak)
+        if mic.peak > Self.micActivityThreshold || sys.peak > Self.systemActivityThreshold {
+            let now = Date().timeIntervalSinceReferenceDate
+            lastActivity.withLock { $0 = now }
         }
 
+        lastHostSeconds = Double(hostTime) * Self.secondsPerHostTick
+        let measured = meter.add(frames: sys.samples.count, at: lastHostSeconds)
+        if pipes == nil {
+            heldMic.append(contentsOf: mic.samples)
+            heldSys.append(contentsOf: sys.samples)
+            if let measured {
+                settle(on: measured)
+            } else if Double(heldSys.count) > Self.calibrationGiveUpSeconds * nominalRate {
+                // Timestamps that never advance would hold audio forever.
+                harkLog("meeting: WARNING — could not measure the input rate (buffer timestamps are not advancing); assuming the nominal \(Int(nominalRate)) Hz.")
+                settle(on: nominalRate)
+            }
+        } else {
+            if let measured { recheck(measured) }
+            pipes?.mic.feed(mic.samples)
+            pipes?.sys.feed(sys.samples)
+        }
         drainPaired()
+    }
+
+    /// Ends calibration: builds the converters for `rate` and runs the held
+    /// audio through them.
+    private func settle(on rate: Double) {
+        // Within a few percent of nominal is the nominal rate, measured
+        // through clock drift and timestamp jitter.
+        let chosen = abs(rate / nominalRate - 1) < 0.05 ? nominalRate : rate
+        if chosen != nominalRate {
+            harkLog("meeting: audio is arriving at \(Int(chosen)) Hz, not the device's nominal \(Int(nominalRate)) Hz — converting from the measured rate.")
+        }
+        guard rebuildPipes(for: chosen) else { return }
+        pipes?.mic.feed(heldMic)
+        pipes?.sys.feed(heldSys)
+        heldMic = []
+        heldSys = []
+        meter.window = Self.monitorSeconds
+    }
+
+    /// The rate can change mid-recording (a headset switching profile when
+    /// another app takes or releases its microphone). One odd window is
+    /// noise; two in a row that agree with each other is a real change.
+    private func recheck(_ measured: Double) {
+        guard measured != inputRate, abs(measured / inputRate - 1) >= 0.05 else {
+            disputedRate = nil
+            return
+        }
+        guard disputedRate == measured else {
+            disputedRate = measured
+            return
+        }
+        disputedRate = nil
+        harkLog("meeting: input rate changed from \(Int(inputRate)) Hz to \(Int(measured)) Hz mid-recording — rebuilding the converters. Up to \(Int(3 * Self.monitorSeconds)) s around the change is at the wrong speed.")
+        rebuildPipes(for: measured)
+    }
+
+    /// Swaps in converters for `rate`, keeping whatever 16 kHz audio the old
+    /// ones had not yet written. Returns false (logged) if they can't be made.
+    @discardableResult
+    private func rebuildPipes(for rate: Double) -> Bool {
+        do {
+            let mic = try ChannelPipe(inputSampleRate: rate)
+            let sys = try ChannelPipe(inputSampleRate: rate)
+            if let old = pipes {
+                mic.fifo = old.mic.fifo
+                sys.fifo = old.sys.fifo
+            }
+            pipes = (mic, sys)
+            inputRate = rate
+            return true
+        } catch {
+            harkLog("meeting: WARNING — could not build converters for \(Int(rate)) Hz: \(error)")
+            return false
+        }
     }
 
     /// Interleaves however many frames BOTH pipes have ready (the converters
     /// may emit slightly different counts per callback) and appends them to
     /// the WAV file: ch0 = mic, ch1 = system.
     private func drainPaired() {
+        guard let (micPipe, sysPipe) = pipes else { return }
         let n = min(micPipe.fifo.count, sysPipe.fifo.count)
         guard n > 0 else { return }
         var chunk = [Int16]()
@@ -655,14 +824,21 @@ private final class MeetingCaptureIO: @unchecked Sendable {
     /// silence so no captured audio is dropped), patches the WAV header, and
     /// closes the file. Call only after the IO queue is drained.
     func finish() -> (callbackCount: Int, framesWritten: Int, micPeak: Float, systemPeak: Float) {
-        let n = max(micPipe.fifo.count, sysPipe.fifo.count)
-        if n > 0 {
-            micPipe.padZeros(to: n)
-            sysPipe.padZeros(to: n)
-            drainPaired()
+        if pipes == nil, !heldSys.isEmpty {
+            // Stopped inside the first second: go with what was seen of the
+            // rate so far, or the nominal rate if even that is too little.
+            settle(on: meter.partial(until: lastHostSeconds) ?? nominalRate)
+        }
+        if let (micPipe, sysPipe) = pipes {
+            let n = max(micPipe.fifo.count, sysPipe.fifo.count)
+            if n > 0 {
+                micPipe.padZeros(to: n)
+                sysPipe.padZeros(to: n)
+                drainPaired()
+            }
         }
         writer.finish()
-        return (callbackCount, framesWritten, micPipe.peak, sysPipe.peak)
+        return (callbackCount, framesWritten, micPeak, sysPeak)
     }
 
     /// Failure path during start(): close and delete the half-created file.
@@ -682,7 +858,8 @@ private final class MeetingCaptureIO: @unchecked Sendable {
 /// written up front, samples are appended as they arrive, and finish()
 /// patches the RIFF/data sizes (the spike's WavFile, made streaming).
 /// Touched only from the IO queue plus the post-drain finish()/abandon().
-private final class WavStreamWriter: @unchecked Sendable {
+/// Also used by CaptureDump for one-shot dictation captures.
+final class WavStreamWriter: @unchecked Sendable {
     private let url: URL
     private let handle: FileHandle
     private var dataBytes: UInt32 = 0

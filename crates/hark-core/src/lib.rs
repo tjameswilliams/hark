@@ -2,6 +2,7 @@ pub mod db;
 pub mod ffi;
 pub mod knowledge;
 pub mod models;
+pub mod speakers;
 
 pub use db::Db;
 

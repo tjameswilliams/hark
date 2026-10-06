@@ -1,10 +1,12 @@
 import AppKit
+import AVFoundation
 import Observation
 import SwiftUI
 
 // The post-meeting window. It opens the moment a recording stops, for any
 // reason, shows the transcript being produced, and then lets the user name
-// the meeting and file it under a project (existing or new). A meeting that
+// the meeting, say who each voice was, and file it under a project
+// (existing or new). A meeting that
 // is named and assigned, and indexed, is "filed"; one dismissed with Later
 // stays in the library under its default title, unassigned, exactly as
 // before this window existed.
@@ -30,6 +32,63 @@ enum MeetingStopReason: Equatable, Sendable {
         case .quit: return "Hark quit during the recording; the file was closed safely."
         }
     }
+}
+
+/// One voice in the meeting, as a row of the "who is this?" step. `name` is
+/// what the user edits; it starts as the recognized person, if any.
+@MainActor
+@Observable
+final class ReviewSpeaker: Identifiable {
+    let label: String
+    var name: String
+    /// True when `name` was filled in by a voice match the user has not
+    /// reviewed yet.
+    let recognized: Bool
+    /// A person this voice resembles, not closely enough to fill in.
+    let suggestedName: String?
+    let talkSeconds: Int
+    /// Most of this voice arrived through this Mac's microphone.
+    let onLocalMic: Bool
+    /// Where in the recording to play this voice from, in seconds.
+    let clip: ClosedRange<Double>?
+    /// False for meetings recorded before Hark kept voiceprints: the voice
+    /// can be named, but not played or learned.
+    let hasProfile: Bool
+
+    nonisolated var id: String { label }
+
+    init(_ record: MeetingSpeakerRecord) {
+        label = record.label
+        name = record.name ?? ""
+        recognized = record.name != nil && !record.confirmed
+        suggestedName = record.suggestedName
+        hasProfile = record.talkMs != nil
+        talkSeconds = Int((record.talkMs ?? 0) / 1000)
+        onLocalMic = (record.micShare ?? 0) >= 0.7
+        if let start = record.clipStartMs, let end = record.clipEndMs, end > start {
+            clip = (Double(start) / 1000)...(Double(end) / 1000)
+        } else {
+            clip = nil
+        }
+    }
+
+    /// "SPEAKER_01 · 4 min · your microphone". The label is how this voice
+    /// reads in the transcript until it has a name.
+    var detail: String {
+        var parts = [label]
+        if hasProfile {
+            parts.append(talkSeconds >= 60 ? "\(talkSeconds / 60) min" : "\(talkSeconds) sec")
+        }
+        if onLocalMic { parts.append("your microphone") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Too brief to be worth asking about (a cough, a "yeah"), unless Hark
+    /// already has a name or a guess for it.
+    var isBrief: Bool {
+        hasProfile && talkSeconds < Self.briefSeconds && name.isEmpty && suggestedName == nil
+    }
+    static let briefSeconds = 5
 }
 
 /// One stopped recording on its way to being filed. Owned by the
@@ -63,6 +122,10 @@ final class MeetingReviewSession: Identifiable {
     var transcript: String?
     var speakerCount: Int = 0
     var segmentCount: Int = 0
+    /// The meeting's voices, longest talker first; empty until processed.
+    var speakers: [ReviewSpeaker] = []
+    /// Names of everyone named in earlier meetings, to pick from.
+    var knownPeople: [String] = []
     /// Failure from the File action itself (distinct from a processing
     /// failure): shown inline, the form stays editable.
     var fileError: String?
@@ -99,8 +162,8 @@ final class MeetingReviewSession: Identifiable {
 @MainActor
 protocol MeetingFiler: AnyObject {
     func projectChoices() -> [(id: Int64, name: String)]
-    /// Names the meeting, creates `newProjectName` if given, assigns it, and
-    /// kicks indexing. Throws on any store failure; the session's phase
+    /// Names the meeting and its speakers (from `session.speakers`), creates
+    /// `newProjectName` if given, assigns it, and kicks indexing. Throws on any store failure; the session's phase
     /// becomes .filed on success.
     func file(_ session: MeetingReviewSession, title: String, projectId: Int64?, newProjectName: String?) throws
 }
@@ -118,7 +181,7 @@ final class MeetingReviewWindowController: NSWindowController, NSWindowDelegate 
     init(filer: MeetingFiler) {
         self.filer = filer
         let window = HarkMainWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "Meeting Recorded"
@@ -167,13 +230,14 @@ final class MeetingReviewWindowController: NSWindowController, NSWindowDelegate 
         // shrinks it to the content's minimum.
         host.sizingOptions = []
         window?.contentView = host
-        window?.setContentSize(NSSize(width: 640, height: 620))
+        window?.setContentSize(NSSize(width: 640, height: 700))
         moveToActiveScreen()
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func windowWillClose(_ notification: Notification) {
+        ClipPlayer.shared.stop()
         if let current, case .ready = current.phase {
             harkLog("meeting review: closed without filing; meeting stays as “\(current.defaultTitle)”, unassigned.")
         }
@@ -212,6 +276,7 @@ struct MeetingReviewView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     statusCard
                     form
+                    speakersSection
                     transcriptSection
                 }
                 .padding(20)
@@ -270,7 +335,7 @@ struct MeetingReviewView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Transcript ready")
                         .font(.headline)
-                    Text("\(session.speakerCount) speaker\(session.speakerCount == 1 ? "" : "s") · \(session.segmentCount) segment\(session.segmentCount == 1 ? "" : "s"). Name it and pick a project to file it.")
+                    Text("\(session.speakerCount) speaker\(session.speakerCount == 1 ? "" : "s") · \(session.segmentCount) segment\(session.segmentCount == 1 ? "" : "s"). Name it, say who spoke, and pick a project to file it.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -347,6 +412,42 @@ struct MeetingReviewView: View {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .font(.callout)
+            }
+        }
+    }
+
+    // MARK: Speakers
+
+    private var listedSpeakers: [ReviewSpeaker] {
+        session.speakers.filter { !$0.isBrief }
+    }
+
+    @ViewBuilder
+    private var speakersSection: some View {
+        let listed = listedSpeakers
+        if !listed.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Speakers").font(.subheadline.weight(.semibold))
+                Text("Play a voice and say who it is. Hark recognizes people you have named before, and learns from each one you confirm.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(spacing: 0) {
+                    ForEach(listed) { speaker in
+                        SpeakerRow(
+                            speaker: speaker, audioPath: session.audioPath,
+                            knownPeople: session.knownPeople, disabled: isFiled)
+                        if speaker.id != listed.last?.id { Divider() }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                let hidden = session.speakers.count - listed.count
+                if hidden > 0 {
+                    Text("\(hidden) brief voice\(hidden == 1 ? "" : "s") under \(ReviewSpeaker.briefSeconds) seconds not listed.")
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
     }
@@ -453,6 +554,159 @@ struct MeetingReviewView: View {
     }
 }
 
+
+// MARK: - Speaker row
+
+/// One voice: play it, name it. Shared by the post-meeting window and the
+/// library's speaker sheet.
+struct SpeakerRow: View {
+    @Bindable var speaker: ReviewSpeaker
+    /// The meeting recording; nil when it is no longer on disk.
+    let audioPath: String?
+    let knownPeople: [String]
+    let disabled: Bool
+
+    private var player: ClipPlayer { ClipPlayer.shared }
+    private var isPlaying: Bool { player.playing == speaker.label }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                if isPlaying {
+                    player.stop()
+                } else if let clip = speaker.clip, let audioPath {
+                    player.play(label: speaker.label, path: audioPath, clip: clip)
+                }
+            } label: {
+                Image(systemName: isPlaying ? "stop.circle.fill" : "play.circle.fill")
+                    .font(.title2)
+            }
+            .buttonStyle(.borderless)
+            .disabled(speaker.clip == nil || audioPath == nil)
+            .help(isPlaying ? "Stop" : "Play a few seconds of this voice")
+            .accessibilityLabel(isPlaying ? "Stop" : "Play this voice")
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 4) {
+                    TextField("Who is this?", text: $speaker.name)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                    if !knownPeople.isEmpty {
+                        Menu {
+                            ForEach(knownPeople, id: \.self) { person in
+                                Button(person) { speaker.name = person }
+                            }
+                        } label: {
+                            Image(systemName: "person.crop.circle")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Pick someone you have named before")
+                    }
+                }
+                .disabled(disabled)
+                detail
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        HStack(spacing: 6) {
+            Text(speaker.detail)
+                .foregroundStyle(.secondary)
+            if speaker.recognized, !speaker.name.isEmpty {
+                Label("Recognized by voice", systemImage: "waveform")
+                    .foregroundStyle(.secondary)
+            } else if let suggestion = speaker.suggestedName, speaker.name.isEmpty, !disabled {
+                Button("Sounds like \(suggestion)") { speaker.name = suggestion }
+                    .buttonStyle(.link)
+            }
+        }
+        .font(.callout)
+    }
+}
+
+/// Plays one speaker's clip from the meeting recording. The recording keeps
+/// the mic and the system audio in separate channels, so the clip is mixed
+/// to mono first — otherwise a remote voice plays in one ear only.
+@MainActor
+@Observable
+final class ClipPlayer {
+    static let shared = ClipPlayer()
+
+    /// Label of the speaker whose clip is playing, if any.
+    private(set) var playing: String?
+    @ObservationIgnored private var player: AVAudioPlayer?
+    @ObservationIgnored private var finish: Task<Void, Never>?
+
+    func play(label: String, path: String, clip: ClosedRange<Double>) {
+        stop()
+        do {
+            let player = try AVAudioPlayer(data: Self.monoWav(path: path, clip: clip))
+            guard player.play() else { throw ClipError.wouldNotPlay }
+            self.player = player
+            playing = label
+            finish = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(player.duration + 0.1))
+                guard !Task.isCancelled else { return }
+                self?.stop()
+            }
+        } catch {
+            harkLog("meeting review: WARNING — could not play the clip for \(label): \(error)")
+        }
+    }
+
+    func stop() {
+        finish?.cancel()
+        finish = nil
+        player?.stop()
+        player = nil
+        playing = nil
+    }
+
+    private enum ClipError: Error { case empty, wouldNotPlay }
+
+    /// The clip as an in-memory 16-bit mono WAV, peak-normalized so a quiet
+    /// remote voice is as audible as a close microphone.
+    private static func monoWav(path: String, clip: ClosedRange<Double>) throws -> Data {
+        let file = try AVAudioFile(forReading: URL(fileURLWithPath: path))
+        let format = file.processingFormat
+        let start = AVAudioFramePosition(clip.lowerBound * format.sampleRate)
+        let wanted = AVAudioFrameCount((clip.upperBound - clip.lowerBound) * format.sampleRate)
+        guard start < file.length, wanted > 0,
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: wanted)
+        else { throw ClipError.empty }
+        file.framePosition = start
+        try file.read(into: buffer, frameCount: wanted)
+        let frames = Int(buffer.frameLength)
+        guard frames > 0, let channels = buffer.floatChannelData else { throw ClipError.empty }
+
+        var mono = [Float](repeating: 0, count: frames)
+        for channel in 0..<Int(format.channelCount) {
+            for i in 0..<frames { mono[i] += channels[channel][i] }
+        }
+        let peak = mono.reduce(0) { max($0, abs($1)) }
+        let gain = peak > 0 ? min(0.7 / peak, 30) : 1
+
+        let sampleRate = UInt32(format.sampleRate)
+        let dataBytes = UInt32(frames * 2)
+        var wav = Data(capacity: 44 + frames * 2)
+        func append<T: FixedWidthInteger>(_ value: T) {
+            withUnsafeBytes(of: value.littleEndian) { wav.append(contentsOf: $0) }
+        }
+        wav.append(contentsOf: Array("RIFF".utf8)); append(36 + dataBytes)
+        wav.append(contentsOf: Array("WAVEfmt ".utf8)); append(UInt32(16))
+        append(UInt16(1)); append(UInt16(1)); append(sampleRate); append(sampleRate * 2)
+        append(UInt16(2)); append(UInt16(16))
+        wav.append(contentsOf: Array("data".utf8)); append(dataBytes)
+        for sample in mono {
+            append(Int16(max(-1, min(1, sample * gain)) * Float(Int16.max)))
+        }
+        return wav
+    }
+}
 
 // MARK: - The silence question
 
